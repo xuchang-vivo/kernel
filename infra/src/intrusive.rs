@@ -32,17 +32,59 @@ macro_rules! impl_simple_intrusive_adapter {
     }
 }
 
-pub struct Relative<S, T, From: const Adapter<S>, To: const Adapter<S>>(
-    PhantomData<S>,
+// This adapter is used when T has a field which has `From` adapter, the other
+// field which has `To` adapter. Now we have a reference to the field owns the `From` adapter,
+// we use this adapter to access the field owns the `To` adapter.
+pub struct Relative<T, From: const Adapter<T>, To: const Adapter<T>, S>(
     PhantomData<T>,
     PhantomData<From>,
     PhantomData<To>,
+    PhantomData<S>,
 );
 
-impl<S, T, From: const Adapter<S>, To: const Adapter<S>> const Adapter<T>
-    for Relative<S, T, From, To>
+impl<T, From: const Adapter<T>, To: const Adapter<T>, S> const Adapter<S>
+    for Relative<T, From, To, S>
 {
     fn offset() -> usize {
-        To::offset() - From::offset()
+        From::offset().wrapping_sub(To::offset())
+    }
+}
+
+// It's used when P has a field whose type is N. N also has an instrusive adapter.
+// When we have the reference to this field, we can get the reference to P via this
+// adapter.
+#[derive(Default, Debug)]
+pub struct Nested<P, S: Adapter<P>, N, T: Adapter<N>>(
+    PhantomData<P>,
+    PhantomData<S>,
+    PhantomData<N>,
+    PhantomData<T>,
+);
+
+impl<P, S: const Adapter<P>, N, T: const Adapter<N>> const Adapter<P> for Nested<P, S, N, T> {
+    fn offset() -> usize {
+        S::offset() + T::offset()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[repr(C)]
+    struct Foo {
+        a: u32,
+        b: u32,
+    }
+
+    impl_simple_intrusive_adapter!(A, Foo, a);
+    impl_simple_intrusive_adapter!(B, Foo, b);
+
+    #[test]
+    fn test_relative_adapter() {
+        assert_eq!(
+            Relative::<Foo, B, A, u32>::offset(),
+            core::mem::size_of::<u32>()
+        );
     }
 }
