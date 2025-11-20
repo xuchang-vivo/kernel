@@ -11,13 +11,3 @@
 // WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 // See the License for the specific language governing permissions and
 // limitations under the License.
-
-#![no_std]
-#![feature(const_nonnull_new)]
-
-pub mod clock_control;
-pub mod pinctrl;
-pub mod reset;
-pub mod spi;
-pub mod static_ref;
-pub mod uart;
