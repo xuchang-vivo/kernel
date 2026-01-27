@@ -23,7 +23,7 @@ template("tm_case") {
     sources = _sources
 
     # Default is 30 in source code, too long for inpsecting immediate result.
-    cflags = [ "-DTM_TEST_DURATION=2" ]
+    cflags = [ "-DTM_TEST_DURATION=30" ]
     configs += [ "//build/boards/${board}:kernel_config" ]
     deps = board_deps
   }

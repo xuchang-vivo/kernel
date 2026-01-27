@@ -216,8 +216,8 @@ fn switch_current_thread(next: ThreadNode, old_sp: usize) -> usize {
     let ok = next.transfer_state(thread::READY, thread::RUNNING);
     debug_assert_eq!(ok, Ok(()));
     let mut old = set_current_thread(next);
-    #[cfg(thread_stats)]
-    old.lock().increment_cycles(cycles);
+    // #[cfg(thread_stats)]
+    // old.lock().increment_cycles(cycles);
     #[cfg(debugging_scheduler)]
     crate::trace!(
         "Switching from 0x{:x}: {{ SP: 0x{:x} PRI: {} }} to 0x{:x}: {{ SP: 0x{:x} PRI: {} }}",
