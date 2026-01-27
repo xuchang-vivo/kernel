@@ -207,11 +207,11 @@ fn switch_current_thread(next: ThreadNode, old_sp: usize) -> usize {
     // Handling signals relies on previously saved sp, so it must be put between
     // spin_until_ready_to_run and clear_saved_sp.
     // FIXME: Signal feature should be optional.
-    {
-        if next.lock().has_pending_signals() {
-            prepare_signal_handling(&next);
-        }
-    }
+    // {
+    //     if next.lock().has_pending_signals() {
+    //         prepare_signal_handling(&next);
+    //     }
+    // }
     next.clear_saved_sp();
     let ok = next.transfer_state(thread::READY, thread::RUNNING);
     debug_assert_eq!(ok, Ok(()));

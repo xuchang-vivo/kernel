@@ -81,13 +81,13 @@ pub type ClockImpl = systick::SysTickClock<TICKS_PS, 150_000_000usize>;
 
 pub(crate) fn init() {
     unsafe {
-        const SCB_CPACR_PTR: *mut u32 = 0xE000_ED88 as *mut u32;
-        const SCB_CPACR_FULL_ACCESS: u32 = 0b11;
-        let mut temp = SCB_CPACR_PTR.read_volatile();
-        temp |= SCB_CPACR_FULL_ACCESS << (4 * 2);
-        temp |= 0x00F00000;
-        SCB_CPACR_PTR.write_volatile(temp);
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+        // const SCB_CPACR_PTR: *mut u32 = 0xE000_ED88 as *mut u32;
+        // const SCB_CPACR_FULL_ACCESS: u32 = 0b11;
+        // let mut temp = SCB_CPACR_PTR.read_volatile();
+        // temp |= SCB_CPACR_FULL_ACCESS << (4 * 2);
+        // temp |= 0x00F00000;
+        // SCB_CPACR_PTR.write_volatile(temp);
+        // core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
         copy_data();
     }
     boot::init_runtime();
