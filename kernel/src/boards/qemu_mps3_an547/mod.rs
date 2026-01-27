@@ -87,7 +87,10 @@ const HZ: usize = SYSTEM_CORE_CLOCK as usize;
 pub type ClockImpl = systick::SysTickClock<TICKS_PS, HZ>;
 
 pub(crate) fn init() {
-    unsafe { enable_fpu() };
+    #[cfg(has_fpu)]
+    unsafe {
+        enable_fpu()
+    };
 
     unsafe {
         copy_data();
