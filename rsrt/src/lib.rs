@@ -36,16 +36,16 @@ unsafe impl GlobalAlloc for PosixAllocator {
 #[global_allocator]
 static GLOBAL: PosixAllocator = PosixAllocator;
 
-// #[cfg(not(feature = "std"))]
-// #[panic_handler]
-// fn oops(info: &core::panic::PanicInfo) -> ! {
-//     #[cfg(test)]
-//     {
-//         semihosting::println!("{}", info);
-//         semihosting::println!("{}", info.message());
-//     }
-//     loop {}
-// }
+#[cfg(not(feature = "std"))]
+#[panic_handler]
+fn oops(info: &core::panic::PanicInfo) -> ! {
+    #[cfg(test)]
+    {
+        semihosting::println!("{}", info);
+        semihosting::println!("{}", info.message());
+    }
+    loop {}
+}
 
 #[used]
 #[link_section = ".bk_app_array"]
