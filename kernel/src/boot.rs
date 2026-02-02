@@ -160,10 +160,10 @@ extern "C" fn init() {
     #[cfg(not(target_arch = "riscv64"))]
     logger::logger_init();
     time::timer::init();
-    #[cfg(kernel_async)]
-    asynk::init();
-    #[cfg(enable_net)]
-    net::net_manager::init();
+    // #[cfg(kernel_async)]
+    // asynk::init();
+    // #[cfg(enable_net)]
+    // net::net_manager::init();
     #[cfg(enable_vfs)]
     init_vfs();
     init_apps();

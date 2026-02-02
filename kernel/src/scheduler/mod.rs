@@ -197,10 +197,10 @@ fn switch_current_thread(next: ThreadNode, old_sp: usize) -> usize {
         let deadline = now.add(time_slices);
         set_current_timer(deadline);
     }
-    #[cfg(thread_stats)]
-    let cycles = time::current_clock_cycles();
-    #[cfg(thread_stats)]
-    next.lock().set_start_cycles(cycles);
+    // #[cfg(thread_stats)]
+    // let cycles = time::current_clock_cycles();
+    // #[cfg(thread_stats)]
+    // next.lock().set_start_cycles(cycles);
     let next_id = Thread::id(&next);
     let next_priority = next.priority();
     let next_saved_sp = spin_until_ready_to_run(&next);
@@ -234,8 +234,8 @@ fn switch_current_thread(next: ThreadNode, old_sp: usize) -> usize {
         let elapsed = now.since(start);
         old.elapse_time_slices(elapsed);
     }
-    #[cfg(thread_stats)]
-    old.lock().increment_cycles(cycles);
+    // #[cfg(thread_stats)]
+    // old.lock().increment_cycles(cycles);
     if old.state() == thread::RETIRED {
         let cleanup = old.lock().take_cleanup();
         if let Some(entry) = cleanup {
