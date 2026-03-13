@@ -424,6 +424,7 @@ jobs:
     strategy:
       matrix:
         board: [qemu_mps2_an385, qemu_mps3_an547, qemu_riscv64, qemu_virt64_aarch64, qemu_riscv32, gd32e507_eval, rk3568, gd32vw553_eval, seeed_xiao_esp32c3, raspberry_pico2_cortexm]
+        shell_test_on_board: [qemu_mps3_an547]
         build_type: [release, debug]
         syscall_mode: [swi, dsc]
     steps:
@@ -466,6 +467,12 @@ jobs:
                 console.error(`❌ ${profile} build failed:`, error.message);
                 process.exit(1);
             }
+      - name: Test shell for ${{ matrix.shell_test_on_board }}.${{ matrix.build_type }}.${{ matrix.syscall_mode }}
+        uses: antmicro/renode-test-action@v5
+        with:
+          renode-revision: 'master'
+          tests-to-run: 'tests/**/*.robot'
+
   notify:
     runs-on: ubuntu-latest
     needs: [setup, check_format, check_license, build_host, build_and_check_boards]

@@ -1,0 +1,18 @@
+$name?="mps3_corstone300_an547"
+$bin?=$ORIGIN/../../../out/qemu_mps3_an547.debug.swi/bin/shell
+$repl?=$ORIGIN/mps3_an547.repl
+
+using sysbus
+mach create $name
+
+machine LoadPlatformDescription $repl
+
+showAnalyzer uart0
+
+macro reset
+"""
+    sysbus LoadELF $bin 
+    cpu0 VectorTableOffset `sysbus GetSymbolAddress "__vector_table_start"`
+"""
+
+runMacro $reset
