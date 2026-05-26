@@ -144,7 +144,8 @@ extern "C" fn init() {
     time::timer::init();
     #[cfg(kernel_async)]
     asynk::init();
-    #[cfg(enable_net)] {
+    #[cfg(enable_net)]
+    {
         net::init();
         net::net_manager::init();
     }
