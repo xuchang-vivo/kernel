@@ -29,10 +29,7 @@ impl Tick {
     pub const MAX: Self = Self(usize::MAX);
 
     pub fn from_millis(millis: u64) -> Self {
-        match millis.checked_mul(TICKS_PER_SECOND as u64) {
-            Some(p) => Self((p / 1000) as usize),
-            None => Self::MAX,
-        }
+        Self((millis * (TICKS_PER_SECOND as u64) / 1000) as usize)
     }
 
     pub fn as_millis(&self) -> u64 {
@@ -40,11 +37,7 @@ impl Tick {
     }
 
     pub fn from_micros(micros: u64) -> Self {
-        let product = micros.checked_mul(TICKS_PER_SECOND as u64);
-        match product {
-            Some(p) => Self((p / 1_000_000) as usize),
-            None => Self::MAX,
-        }
+        Self((micros * (TICKS_PER_SECOND as u64) / 1_000_000) as usize)
     }
 
     pub fn as_micros(&self) -> u64 {
@@ -52,10 +45,7 @@ impl Tick {
     }
 
     pub fn from_nanos(nanos: u64) -> Self {
-        match nanos.checked_mul(TICKS_PER_SECOND as u64) {
-            Some(p) => Self((p / 1_000_000_000) as usize),
-            None => Self::MAX,
-        }
+        Self((nanos * (TICKS_PER_SECOND as u64) / 1_000_000_000) as usize)
     }
 
     pub fn after(n: Self) -> Self {

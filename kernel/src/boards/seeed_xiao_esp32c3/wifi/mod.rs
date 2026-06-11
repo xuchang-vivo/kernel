@@ -85,6 +85,11 @@ static mut WIFI_INIT_STORAGE: SystemThreadStorage = SystemThreadStorage::new(Thr
 static mut WIFI_INIT: MaybeUninit<ThreadNode> = MaybeUninit::zeroed();
 
 extern "C" fn wifi_inner_init() {
+    crate::asynk::spawn(async {
+        loop {
+            crate::asynk::yield_now().await;
+        }
+    });
     crate::boards::wifi::wifi_init().expect("Failed to initialize Wi-Fi");
 }
 
