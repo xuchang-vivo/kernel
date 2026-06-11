@@ -433,8 +433,6 @@ impl InodeOps for TmpInode {
                 .map_err(Error::from);
         }
 
-        let mut inner = self.inner.write();
-
         let write_end = offset + buf.len();
         let need_resize;
         {
