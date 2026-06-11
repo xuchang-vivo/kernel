@@ -31,10 +31,9 @@ pub(crate) mod types;
 pub use error::NetError;
 pub use types::*;
 
+use crate::net::{link::LinkLayer, smoltcp::DeviceEntry};
 use alloc::{sync::Arc, vec::Vec};
 use spin;
-
-use crate::net::smoltcp::DeviceEntry;
 
 use crate::net::link::loopback::LoopbackLink;
 
@@ -62,6 +61,14 @@ pub(crate) fn init() {
                 crate::net::link::virtio::VirtioLink::new(0),
             )),
         ));
+    }
+
+    #[cfg(target_board = "seeed_xiao_esp32c3")]
+    {
+        let device = Arc::new(spin::RwLock::new(
+            crate::boards::seeed_xiao_esp32c3::wifi::WifiController::new(),
+        ));
+        devices.push(("wlan0", false, device));
     }
     // DEVICE_ENTRY here must match DeviceEntry in smoltcp/mod.rs.
     smoltcp::init_devices(&devices);

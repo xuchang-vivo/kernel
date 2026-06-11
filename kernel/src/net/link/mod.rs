@@ -34,23 +34,26 @@
 //! - **dyn-compatible**: `LinkLayer` is dyn-compatible.
 
 pub(crate) mod ethernet_ops;
-pub(crate) mod link_kind;
 pub(crate) mod loopback;
 pub(crate) mod medium;
 #[cfg(virtio)]
 pub(crate) mod virtio;
 pub(crate) mod wifi_ops;
 
-use core::{any::Any, fmt};
+use core::any::Any;
 
 use alloc::{string::String, sync::Arc, vec::Vec};
+use core::fmt;
 use spin;
 
-pub(crate) use self::{link_kind::LinkKind, medium::Medium};
+pub(crate) use self::medium::Medium;
 
 use crate::net::{
     iface::{InterfaceFlags, NetIfaceControl, NetIfaceError, NetIfaceResult},
-    link::{ethernet_ops::EthernetOps, wifi_ops::WifiOps},
+    link::{
+        ethernet_ops::EthernetOps,
+        wifi_ops::{WifiOps, WifiScanResult},
+    },
 };
 
 /// A hardware address (MAC or similar).
@@ -107,8 +110,6 @@ pub trait LinkLayer: Send + Sync + Any + 'static {
     fn mtu(&self) -> usize;
     /// Hardware address (MAC for Ethernet, None for loopback).
     fn hw_addr(&self) -> Option<HwAddr>;
-    /// Kind of link device.
-    fn kind(&self) -> LinkKind;
     /// Whether the device can currently send.
     fn can_send(&self) -> bool;
     /// Whether the device can currently receive.
@@ -178,31 +179,148 @@ impl LinkRegistry {
 /// Global link registry instance.
 pub(crate) static LINK_REGISTRY: LinkRegistry = LinkRegistry::new();
 
-/// Handle a type-safe network control command against the first registered link device.
+/// Global cache for the last WiFi scan results, populated by `WifiScan` and
+/// read by `SIOCGIWSCAN` (from `sockfs`).
+static WIFI_SCAN_CACHE: spin::Mutex<Option<Vec<WifiScanResult>>> = spin::Mutex::new(None);
+
+/// Copy cached WiFi scan results into a user-space buffer.
+///
+/// `buf` is a raw pointer to the user-space destination, `buf_len` is its
+/// capacity. Returns the number of bytes written on success, or `EINVAL` /
+/// `ENOSPC` on error.
+pub(crate) fn copy_scan_results_to_user(
+    buf: *mut u8,
+    buf_len: usize,
+) -> Result<usize, crate::error::Error> {
+    let cache = WIFI_SCAN_CACHE.lock();
+    let results = cache.as_ref().ok_or(crate::error::code::EINVAL)?;
+
+    // Wire format: little-endian u32 count followed by N serialized entries.
+    // Each entry: [u32 ssid_len][ssid bytes][u8[6] bssid][i8 signal][u16 channel][u8 security].
+    let mut needed = core::mem::size_of::<u32>();
+    for ap in results.iter() {
+        needed += core::mem::size_of::<u32>()      // ssid_len
+            + ap.ssid.len()                         // ssid bytes
+            + 6usize                                 // bssid
+            + 1usize                                 // signal_dbm
+            + 2usize                                 // channel
+            + 1usize;                                // security
+    }
+
+    if buf.is_null() {
+        return Ok(needed); // query-size-only call
+    }
+    if buf_len < needed {
+        return Err(crate::error::code::ENOSPC);
+    }
+
+    let mut offset = 0usize;
+
+    // Write count
+    let count = results.len() as u32;
+    unsafe {
+        core::ptr::write_unaligned(buf.add(offset) as *mut u32, count);
+    }
+    offset += core::mem::size_of::<u32>();
+
+    for ap in results.iter() {
+        // ssid_len
+        let ssid_len = ap.ssid.len() as u32;
+        unsafe {
+            core::ptr::write_unaligned(buf.add(offset) as *mut u32, ssid_len);
+        }
+        offset += core::mem::size_of::<u32>();
+
+        // ssid bytes
+        if !ap.ssid.is_empty() {
+            unsafe {
+                core::ptr::copy_nonoverlapping(ap.ssid.as_ptr(), buf.add(offset), ap.ssid.len());
+            }
+            offset += ap.ssid.len();
+        }
+
+        // bssid
+        unsafe {
+            core::ptr::copy_nonoverlapping(ap.bssid.as_ptr(), buf.add(offset), 6);
+        }
+        offset += 6;
+
+        // signal_dbm
+        unsafe {
+            core::ptr::write_unaligned(buf.add(offset) as *mut i8, ap.signal_dbm);
+        }
+        offset += 1;
+
+        // channel
+        unsafe {
+            core::ptr::write_unaligned(buf.add(offset) as *mut u16, ap.channel);
+        }
+        offset += 2;
+
+        // security
+        let sec = ap.security as u8;
+        unsafe {
+            core::ptr::write_unaligned(buf.add(offset) as *mut u8, sec);
+        }
+        offset += 1;
+    }
+
+    Ok(needed)
+}
+
+/// Handle a type-safe network control command, dispatching to the correct
+/// link device by interface name.
 ///
 /// Bridges the POSIX ioctl path (via `Operation::NetControl`) to `LinkLayer`
-/// queries. Only simple getters (flags, MAC, MTU, link kind) are supported;
-/// IP configuration and WiFi operations are dispatched through `NetIface::control()`
-/// which has access to the full smoltcp stack.
+/// device-specific trait operations.
 pub(crate) fn handle_control(cmd: NetIfaceControl) -> Result<NetIfaceResult, NetIfaceError> {
-    let link_arc = LINK_REGISTRY.get(0).ok_or(NetIfaceError::DeviceNotFound)?;
-    let link = link_arc.read();
-
     match cmd {
-        NetIfaceControl::GetFlags => Ok(NetIfaceResult::Flags(InterfaceFlags {
-            up: link.can_send() || link.can_recv(),
-            running: true,
-            promiscuous: false,
-        })),
-        NetIfaceControl::GetMacAddress => {
-            let hw = link
-                .hw_addr()
-                .and_then(|h| h.as_ethernet())
-                .unwrap_or([0u8; 6]);
-            Ok(NetIfaceResult::MacAddress(hw))
+        NetIfaceControl::GetFlags | NetIfaceControl::GetMacAddress | NetIfaceControl::GetMtu => {
+            // Simple getters use the first registered device.
+            let link_arc = LINK_REGISTRY.get(0).ok_or(NetIfaceError::DeviceNotFound)?;
+            let link = link_arc.read();
+            match cmd {
+                NetIfaceControl::GetFlags => Ok(NetIfaceResult::Flags(InterfaceFlags {
+                    up: link.can_send() || link.can_recv(),
+                    running: true,
+                    promiscuous: false,
+                })),
+                NetIfaceControl::GetMacAddress => {
+                    let hw = link
+                        .hw_addr()
+                        .and_then(|h| h.as_ethernet())
+                        .unwrap_or([0u8; 6]);
+                    Ok(NetIfaceResult::MacAddress(hw))
+                }
+                NetIfaceControl::GetMtu => Ok(NetIfaceResult::Mtu(link.mtu())),
+                _ => unreachable!(),
+            }
         }
-        NetIfaceControl::GetMtu => Ok(NetIfaceResult::Mtu(link.mtu())),
-        NetIfaceControl::GetLinkKind => Ok(NetIfaceResult::LinkKind(link.kind())),
+        // WiFi operations: look up the device by interface name.
+        NetIfaceControl::WifiScan(ref config) => {
+            let ifname = config
+                .ifname
+                .iter()
+                .take_while(|&&b| b != 0)
+                .copied()
+                .collect::<alloc::vec::Vec<u8>>();
+            let ifname = core::str::from_utf8(&ifname).unwrap_or("");
+            let link_arc = LINK_REGISTRY
+                .find_by_name(ifname)
+                .ok_or(NetIfaceError::DeviceNotFound)?;
+            let mut link = link_arc.write();
+            let wifi = link
+                .as_wifi()
+                .ok_or(NetIfaceError::DeviceTraitNotAvailable)?;
+            let results = wifi
+                .scan(config)
+                .map_err(|_| NetIfaceError::DeviceTraitNotAvailable)?;
+
+            // Populate global scan cache so SIOCGIWSCAN can retrieve the results.
+            *WIFI_SCAN_CACHE.lock() = Some(results.clone());
+
+            Ok(NetIfaceResult::WifiScanResult(results))
+        }
         _ => Err(NetIfaceError::NotSupported),
     }
 }

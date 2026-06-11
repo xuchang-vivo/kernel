@@ -267,7 +267,6 @@ impl FileOps for File {
             return Err(code::EACCES);
         }
         let mut offset = self.offset.lock();
-        // TODO: support O_DIRECT
         let ret = self
             .dcache
             .inode()
@@ -281,7 +280,6 @@ impl FileOps for File {
             return Err(code::EACCES);
         }
         let mut offset = self.offset.lock();
-        // offset is ignored if O_APPEND is set
         if self.open_flags().contains(OpenFlags::O_APPEND) {
             *offset = self.dcache.size();
         }

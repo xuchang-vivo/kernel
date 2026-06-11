@@ -28,7 +28,7 @@ use smoltcp::{
 use crate::{
     devices::net::virtio_net_device::{VirtIONetDevice, VirtIONetRxToken, VirtIONetTxToken},
     net::{
-        link::{HwAddr, LinkKind, LinkLayer, Medium},
+        link::{HwAddr, LinkLayer, Medium},
         smoltcp::link::SmoltcpDevice,
     },
 };
@@ -87,10 +87,6 @@ impl LinkLayer for VirtioLink {
 
     fn hw_addr(&self) -> Option<HwAddr> {
         Some(HwAddr::from_ethernet([0x02, 0x00, 0x00, 0x00, 0x00, 0x01]))
-    }
-
-    fn kind(&self) -> LinkKind {
-        LinkKind::Virtio
     }
 
     fn can_send(&self) -> bool {

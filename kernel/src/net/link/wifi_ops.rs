@@ -33,6 +33,18 @@ pub struct WifiScanResult {
     pub security: WifiSecurity,
 }
 
+#[derive(Debug, Clone)]
+pub struct WifiScanConfig {
+    /// Interface name (e.g. "wlan0"). Matches `iwreq.ifr_ifrn.ifrn_name`.
+    pub ifname: [u8; 16],
+    /// Optional SSID filter. If set, only scan for this specific SSID.
+    pub ssid: Option<String>,
+    /// Scan type: 0 = active (send probe requests), 1 = passive (listen only).
+    pub scan_type: u8,
+    /// Optional specific channel to scan (0 = scan all channels).
+    pub channel: u16,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WifiSecurity {
     Open,
@@ -47,8 +59,8 @@ pub enum WifiSecurity {
 ///
 /// Accessed via `(link as &dyn Any).downcast_ref::<dyn WifiOps>()`.
 pub trait WifiOps: Send + Sync + Any + 'static {
-    /// Scan for available WiFi networks.
-    fn scan(&mut self) -> Result<Vec<WifiScanResult>, NetError>;
+    /// Scan for available WiFi networks with the given configuration.
+    fn scan(&mut self, config: &WifiScanConfig) -> Result<Vec<WifiScanResult>, NetError>;
     /// Connect to a WiFi network.
     fn connect(&mut self, ssid: &str, passphrase: &str) -> Result<(), NetError>;
     /// Disconnect from the current WiFi network.

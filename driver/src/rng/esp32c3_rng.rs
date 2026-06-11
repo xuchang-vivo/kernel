@@ -12,17 +12,14 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(target_chip = "esp32c3")]
-pub mod esp32_intc;
+pub struct Esp32c3Rng;
 
-#[derive(Debug, Clone, Copy)]
-pub struct Interrupt {
-    pub(crate) source_no: usize,
-    pub(crate) irq_no: usize,
-}
+impl Esp32c3Rng {
+    pub const fn new() -> Self {
+        Self
+    }
 
-impl Interrupt {
-    pub const fn new(source_no: usize, irq_no: usize) -> Self {
-        Self { source_no, irq_no }
+    pub fn read_one(&self) -> u32 {
+        unsafe { core::ptr::read_volatile(0x6002_60B0 as *const u32) }
     }
 }

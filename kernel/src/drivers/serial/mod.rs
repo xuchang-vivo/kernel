@@ -82,77 +82,77 @@ pub static TTY_SERIAL: Serial = Serial {
 
 impl Serial {
     pub fn send_bytes(&self, bytes: &[u8], is_nonblocking: bool) -> Result<usize, ErrorKind> {
-        if is_in_irq() {
-            // Caution: logging in IRQ context can extend interrupt-off latency.
-            //
-            // We intentionally use polling here (same behavior as `kearly_printkln!`) instead
-            // of waiting for TX IRQ progress:
-            // 1) some IRQ contexts run with interrupts masked;
-            // 2) current IRQ priority may be higher than UART TX IRQ, so TX handler cannot run.
-            //
-            // In those cases, relying on TX interrupt-driven drain may stall forever. Polling
-            // guarantees forward progress for emergency logs, but callers should keep IRQ logs
-            // short and infrequent.
-            #[cfg(smp)]
-            let _lock = self.critical_section_guard.irqsave_lock();
-            for &b in bytes {
-                self.send_byte_polling(b);
-            }
-            Ok(bytes.len())
-        } else {
-            let mut nbytes = 0;
-            let _spinlock = self.tx_lock.write();
-            self.dev.disable_interrupt(InterruptType::Tx);
-            'e: for &b in bytes {
-                #[cfg(smp)]
-                let _lock = self.critical_section_guard.irqsave_lock();
-
-                match self.send_byte_fifo(b) {
-                    Ok(()) => {
-                        nbytes += 1;
-                    }
-                    Err(ErrorKind::OutOfMemory) => {
-                        if !is_nonblocking {
-                            #[cfg(smp)]
-                            drop(_lock);
-                            'i: loop {
-                                let tx_seq = self.tx_futex.load(Ordering::Acquire);
-                                // If the FIFO is full and we're in blocking mode, we need to
-                                // trigger the TX interrupt to start sending out the data in FIFO.
-                                self.trigger_tx_interrupt();
-                                if is_schedule_ready() {
-                                    match atomic_wait(&self.tx_futex, tx_seq, Tick::MAX) {
-                                        Ok(()) | Err(code::EAGAIN) => {}
-                                        Err(code::ETIMEDOUT) => return Err(ErrorKind::TimedOut),
-                                        Err(_) => return Err(ErrorKind::Other),
-                                    }
-                                } else {
-                                    while (self.is_tx_full()) {}
-                                }
-                                self.dev.disable_interrupt(InterruptType::Tx);
-                                #[cfg(smp)]
-                                let _lock = self.critical_section_guard.irqsave_lock();
-                                match self.send_byte_fifo(b) {
-                                    Ok(()) => break 'i,
-                                    Err(ErrorKind::OutOfMemory) => {
-                                        continue 'i;
-                                    }
-                                    Err(_) => break 'e,
-                                }
-                            }
-                            nbytes += 1;
-                        }
-                    }
-                    Err(_) => {
-                        // For any other error, we just stop sending
-                        // and return the number of bytes sent so far.
-                        break;
-                    }
-                }
-            }
-            self.trigger_tx_interrupt();
-            Ok(nbytes)
+        // if is_in_irq() || !is_schedule_ready() {
+        // Caution: logging in IRQ context can extend interrupt-off latency.
+        //
+        // We intentionally use polling here (same behavior as `kearly_printkln!`) instead
+        // of waiting for TX IRQ progress:
+        // 1) some IRQ contexts run with interrupts masked;
+        // 2) current IRQ priority may be higher than UART TX IRQ, so TX handler cannot run.
+        //
+        // In those cases, relying on TX interrupt-driven drain may stall forever. Polling
+        // guarantees forward progress for emergency logs, but callers should keep IRQ logs
+        // short and infrequent.
+        #[cfg(smp)]
+        let _lock = self.critical_section_guard.irqsave_lock();
+        for &b in bytes {
+            self.send_byte_polling(b);
         }
+        Ok(bytes.len())
+        // } else {
+        //     let mut nbytes = 0;
+        //     let _spinlock = self.tx_lock.write();
+        //     self.dev.disable_interrupt(InterruptType::Tx);
+        //     'e: for &b in bytes {
+        //         #[cfg(smp)]
+        //         let _lock = self.critical_section_guard.irqsave_lock();
+
+        //         match self.send_byte_fifo(b) {
+        //             Ok(()) => {
+        //                 nbytes += 1;
+        //             }
+        //             Err(ErrorKind::OutOfMemory) => {
+        //                 if !is_nonblocking {
+        //                     #[cfg(smp)]
+        //                     drop(_lock);
+        //                     'i: loop {
+        //                         let tx_seq = self.tx_futex.load(Ordering::Acquire);
+        //                         // If the FIFO is full and we're in blocking mode, we need to
+        //                         // trigger the TX interrupt to start sending out the data in FIFO.
+        //                         self.trigger_tx_interrupt();
+        //                         if is_schedule_ready() {
+        //                             match atomic_wait(&self.tx_futex, tx_seq, Tick::MAX) {
+        //                                 Ok(()) | Err(code::EAGAIN) => {}
+        //                                 Err(code::ETIMEDOUT) => return Err(ErrorKind::TimedOut),
+        //                                 Err(_) => return Err(ErrorKind::Other),
+        //                             }
+        //                         } else {
+        //                             while (self.is_tx_full()) {}
+        //                         }
+        //                         self.dev.disable_interrupt(InterruptType::Tx);
+        //                         #[cfg(smp)]
+        //                         let _lock = self.critical_section_guard.irqsave_lock();
+        //                         match self.send_byte_fifo(b) {
+        //                             Ok(()) => break 'i,
+        //                             Err(ErrorKind::OutOfMemory) => {
+        //                                 continue 'i;
+        //                             }
+        //                             Err(_) => break 'e,
+        //                         }
+        //                     }
+        //                     nbytes += 1;
+        //                 }
+        //             }
+        //             Err(_) => {
+        //                 // For any other error, we just stop sending
+        //                 // and return the number of bytes sent so far.
+        //                 break;
+        //             }
+        //         }
+        //     }
+        //     self.trigger_tx_interrupt();
+        //     Ok(nbytes)
+        // }
     }
 
     pub fn read_bytes(&self, bytes: &mut [u8], is_nonblocking: bool) -> Result<usize, ErrorKind> {

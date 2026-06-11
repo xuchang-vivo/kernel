@@ -138,6 +138,8 @@ extern "C" fn init() {
         // initialize virtio
         virtio::init_virtio(&fdt);
     }
+    #[cfg(enable_vfs)]
+    init_vfs();
 
     scheduler::init();
     logger::logger_init();
@@ -149,8 +151,7 @@ extern "C" fn init() {
         net::init();
         net::net_manager::init();
     }
-    #[cfg(enable_vfs)]
-    init_vfs();
+
     init_apps();
     arch::start_schedule(scheduler::schedule);
     unreachable!("We should have jumped to the schedule loop!");

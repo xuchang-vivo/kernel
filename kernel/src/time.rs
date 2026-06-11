@@ -29,15 +29,33 @@ impl Tick {
     pub const MAX: Self = Self(usize::MAX);
 
     pub fn from_millis(millis: u64) -> Self {
-        Self((millis * (TICKS_PER_SECOND as u64) / 1000) as usize)
+        match millis.checked_mul(TICKS_PER_SECOND as u64) {
+            Some(p) => Self((p / 1000) as usize),
+            None => Self::MAX,
+        }
+    }
+
+    pub fn as_millis(&self) -> u64 {
+        (self.0 as u64 * 1000) / (TICKS_PER_SECOND as u64)
     }
 
     pub fn from_micros(micros: u64) -> Self {
-        Self((micros * (TICKS_PER_SECOND as u64) / 1_000_000) as usize)
+        let product = micros.checked_mul(TICKS_PER_SECOND as u64);
+        match product {
+            Some(p) => Self((p / 1_000_000) as usize),
+            None => Self::MAX,
+        }
+    }
+
+    pub fn as_micros(&self) -> u64 {
+        (self.0 as u64 * 1_000_000) / (TICKS_PER_SECOND as u64)
     }
 
     pub fn from_nanos(nanos: u64) -> Self {
-        Self((nanos * (TICKS_PER_SECOND as u64) / 1_000_000_000) as usize)
+        match nanos.checked_mul(TICKS_PER_SECOND as u64) {
+            Some(p) => Self((p / 1_000_000_000) as usize),
+            None => Self::MAX,
+        }
     }
 
     pub fn after(n: Self) -> Self {
@@ -72,6 +90,11 @@ impl Tick {
     pub fn interrupt_after(diff: Self) {
         let nth = Self::after(diff);
         Self::interrupt_at(nth);
+    }
+
+    pub fn is_elapsed(&self) -> bool {
+        let now = Self::now();
+        now.0 >= self.0
     }
 
     pub fn interrupt_at(n: Tick) {

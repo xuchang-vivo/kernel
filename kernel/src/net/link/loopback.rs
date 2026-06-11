@@ -26,7 +26,7 @@ use smoltcp::{
 };
 
 use crate::net::{
-    link::{HwAddr, LinkKind, LinkLayer, Medium},
+    link::{HwAddr, LinkLayer, Medium},
     smoltcp::link::SmoltcpDevice,
 };
 
@@ -81,10 +81,6 @@ impl LinkLayer for LoopbackLink {
 
     fn hw_addr(&self) -> Option<HwAddr> {
         None
-    }
-
-    fn kind(&self) -> LinkKind {
-        LinkKind::Loopback
     }
 
     fn can_send(&self) -> bool {

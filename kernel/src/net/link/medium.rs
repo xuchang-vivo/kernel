@@ -26,4 +26,6 @@ pub enum Medium {
     Ip,
     /// IEEE 802.15.4
     Ieee802154,
+    /// WiFi (IEEE 802.11)
+    Wifi,
 }

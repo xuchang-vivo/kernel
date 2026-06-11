@@ -14,7 +14,7 @@
 
 use crate::{
     error::{code, Error},
-    net::{connection::Connection, iface::control::NetIfaceControl},
+    net::{connection::Connection, iface::control::NetIfaceControl, link::copy_scan_results_to_user},
     vfs::{
         fd_manager::get_fd_manager,
         file::{FileAttr, FileOps, OpenFlags},
@@ -146,8 +146,26 @@ impl FileOps for SocketFile {
     }
 
     fn ioctl(&self, cmd: u32, arg: usize) -> Result<i32, Error> {
-        // Convert raw POSIX ioctl (cmd, arg) into a type-safe NetIfaceControl,
-        // then dispatch through the IPC queue to the network stack thread.
+        // SIOCGIWSCAN (0x8B19) — read cached scan results directly, no IPC needed.
+        if cmd == 0x8B19 {
+            // arg → iwreq → u.data (iw_point) → { pointer, length }
+            let iwreq_arg = arg + 16;
+            let buf_ptr: *mut u8 = unsafe {
+                core::ptr::read_unaligned(iwreq_arg as *const *mut core::ffi::c_void) as *mut u8
+            };
+            let buf_len = unsafe {
+                core::ptr::read_unaligned(
+                    (iwreq_arg + core::mem::size_of::<*mut core::ffi::c_void>()) as *const u16,
+                ) as usize
+            };
+            return match copy_scan_results_to_user(buf_ptr, buf_len) {
+                Ok(n) => Ok(n as i32),
+                Err(code::ENOSPC) => Err(code::ENOSPC),
+                Err(_) => Err(code::EINVAL),
+            };
+        }
+
+        // All other ioctls: convert to typed command and dispatch through IPC.
         let control = unsafe { NetIfaceControl::from_raw_ioctl(cmd, arg) }.map_err(|_| {
             debug!("SocketFile ioctl: unsupported cmd=0x{:x}", cmd);
             code::ENOTTY

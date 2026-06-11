@@ -36,7 +36,7 @@ use core::{ops::Deref, ptr::NonNull};
 /// will always fail to compile since `0x1000` doesn't have an allocation at
 /// compile time, even if it's known to be a valid MMIO address.
 #[derive(Debug)]
-pub(super) struct StaticRef<T> {
+pub struct StaticRef<T> {
     ptr: NonNull<T>,
 }
 

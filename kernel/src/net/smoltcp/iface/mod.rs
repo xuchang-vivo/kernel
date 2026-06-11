@@ -220,23 +220,15 @@ impl NetIface {
                 // State tracking — no-op in Phase 0
                 Ok(NetIfaceResult::Void)
             }
-            NetIfaceControl::GetLinkKind => {
-                let link = self.link.read();
-                Ok(NetIfaceResult::LinkKind(link.kind()))
-            }
-            NetIfaceControl::WifiScan => {
-                let mut link = self.link.write();
-                let wifi = link
-                    .as_wifi()
-                    .ok_or(NetIfaceError::DeviceTraitNotAvailable)?;
-                wifi.scan()
-                    .map(NetIfaceResult::WifiScanResult)
-                    .map_err(|_| NetIfaceError::DeviceTraitNotAvailable)
-            }
-            NetIfaceControl::WifiConnect { .. }
+            // WiFi operations are dispatched via the link-layer `handle_control`
+            // path (link/mod.rs), not through smoltcp `NetIface::control()`.
+            NetIfaceControl::WifiScan(_)
+            | NetIfaceControl::WifiConnect { .. }
             | NetIfaceControl::WifiDisconnect
-            | NetIfaceControl::WifiSignalStrength
-            | NetIfaceControl::EthernetSetPromiscuous(_) => {
+            | NetIfaceControl::WifiSignalStrength => {
+                Err(NetIfaceError::NotSupported)
+            }
+            NetIfaceControl::EthernetSetPromiscuous(_) => {
                 Err(NetIfaceError::DeviceTraitNotAvailable)
             }
             NetIfaceControl::AddAddress(cidr) => {
