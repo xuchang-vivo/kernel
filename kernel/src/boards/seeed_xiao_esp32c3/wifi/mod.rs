@@ -12,13 +12,16 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+mod ap;
 mod event;
 pub(crate) mod os_adapter;
 mod wifi_io;
 use crate::{
+    asynk::{channel, channel::Sender},
     kearly_println,
     net::{
         link::{
+            mark_scan_results_pending, mark_scan_results_unavailable, update_scan_results_cache,
             wifi_ops::{WifiOps, WifiScanConfig, WifiScanResult},
             HwAddr, LinkLayer, Medium,
         },
@@ -41,9 +44,10 @@ use esp_hal as hal;
 use esp_wifi_sys_esp32c3::include::{
     __BindgenBitfieldUnit, esp_event_base_t, esp_interface_t_ESP_IF_WIFI_AP,
     esp_interface_t_ESP_IF_WIFI_STA, esp_supplicant_init, esp_wifi_init_internal,
-    esp_wifi_internal_reg_rxcb, esp_wifi_scan_start, esp_wifi_set_config, esp_wifi_set_country,
-    esp_wifi_set_mode, esp_wifi_set_protocols, esp_wifi_set_ps, esp_wifi_set_tx_done_cb,
-    esp_wifi_start, g_wifi_default_wpa_crypto_funcs, wifi_auth_mode_t_WIFI_AUTH_WPA2_PSK,
+    esp_wifi_internal_reg_rxcb, esp_wifi_scan_get_ap_num, esp_wifi_scan_get_ap_records,
+    esp_wifi_scan_start, esp_wifi_set_config, esp_wifi_set_country, esp_wifi_set_mode,
+    esp_wifi_set_protocols, esp_wifi_set_ps, esp_wifi_set_tx_done_cb, esp_wifi_start,
+    g_wifi_default_wpa_crypto_funcs, wifi_ap_record_t, wifi_auth_mode_t_WIFI_AUTH_WPA2_PSK,
     wifi_config_t, wifi_country_policy_t_WIFI_COUNTRY_POLICY_MANUAL, wifi_country_t,
     wifi_init_config_t, wifi_interface_t_WIFI_IF_STA, wifi_mode_t_WIFI_MODE_NULL,
     wifi_mode_t_WIFI_MODE_STA, wifi_osi_funcs_t, wifi_pmf_config_t, wifi_protocols_t,
@@ -53,6 +57,7 @@ use esp_wifi_sys_esp32c3::include::{
     ESP_WIFI_OS_ADAPTER_MAGIC, ESP_WIFI_OS_ADAPTER_VERSION, WIFI_ENABLE_ENTERPRISE,
     WIFI_ENABLE_WPA3_SAE, WIFI_INIT_CONFIG_MAGIC,
 };
+use event::EventInfo;
 use libc::IW_SCAN_TYPE_ACTIVE;
 use os_adapter::*;
 use smoltcp::{
@@ -71,26 +76,75 @@ pub const WIFI_PROTOCOL_11A: u32 = 16;
 pub const WIFI_PROTOCOL_11AC: u32 = 32;
 pub const WIFI_PROTOCOL_11AX: u32 = 64;
 
-enum WifiState {
-    Idle,
-    Scanning,
-    ScanDone,
-}
-
-pub struct WifiController {
-    state: WifiState,
-}
+pub struct WifiController {}
 
 static mut WIFI_INIT_STORAGE: SystemThreadStorage = SystemThreadStorage::new(ThreadKind::Normal);
 static mut WIFI_INIT: MaybeUninit<ThreadNode> = MaybeUninit::zeroed();
+const EVENTINFO_CHANNEL_SIZE: usize = 4;
+
+/// Safety: initialized in `wifi_inner_init` before being used.
+pub(super) static mut EVENT_SENDER: MaybeUninit<Sender<EventInfo, EVENTINFO_CHANNEL_SIZE>> =
+    MaybeUninit::uninit();
 
 extern "C" fn wifi_inner_init() {
-    crate::asynk::spawn(async {
-        loop {
-            crate::asynk::yield_now().await;
+    let (tx, rx) = crate::asynk::channel::channel::<EventInfo, EVENTINFO_CHANNEL_SIZE>();
+    unsafe {
+        EVENT_SENDER.write(tx);
+    }
+    crate::asynk::spawn(async move {
+        while let Ok(event) = rx.recv().await {
+            match event {
+                EventInfo::ScanDone { .. } => {
+                    log::info!("WiFi scan done");
+
+                    let mut bss_total = 0u16;
+                    let ret = unsafe { esp_wifi_scan_get_ap_num(&mut bss_total as *mut u16) };
+                    if ret != (ESP_OK as i32) || bss_total == 0 {
+                        log::warn!("ScanDone: no APs found (ret={}, count={})", ret, bss_total);
+                        update_scan_results_cache(Vec::new());
+                        continue;
+                    }
+
+                    let mut count = u16::min(bss_total, 10);
+                    let scan_results = unsafe {
+                        let Some(size) =
+                            (count as usize).checked_mul(core::mem::size_of::<wifi_ap_record_t>())
+                        else {
+                            log::error!("ScanDone: AP record buffer size overflow");
+                            continue;
+                        };
+                        let buf = crate::allocator::malloc(size) as *mut wifi_ap_record_t;
+                        let records = if buf.is_null() {
+                            log::error!("ScanDone: failed to allocate AP record buffer");
+                            Vec::new()
+                        } else {
+                            let ret = esp_wifi_scan_get_ap_records(&mut count as *mut u16, buf);
+                            if ret == (ESP_OK as i32) {
+                                let slice = core::slice::from_raw_parts(buf, count as usize);
+                                ap::from_ap_records(slice)
+                            } else {
+                                log::error!(
+                                    "ScanDone: esp_wifi_scan_get_ap_records failed: {}",
+                                    ret
+                                );
+                                Vec::new()
+                            }
+                        };
+                        crate::allocator::free(buf as *mut u8);
+                        records
+                    };
+
+                    // log::info!("Scan results ({} networks):", scan_results.len());
+                    // for (i, r) in scan_results.iter().enumerate() {
+                    //     log::info!("  {}. {} (rssi={}, ch={})", i + 1, r.ssid, r.signal_dbm, r.channel);
+                    // }
+                    update_scan_results_cache(scan_results);
+                }
+                _ => log::debug!("WiFi event: {:?}", event),
+            }
         }
     });
-    crate::boards::wifi::wifi_init().expect("Failed to initialize Wi-Fi");
+    crate::boards::wifi::wifi_init();
 }
 
 impl WifiController {
@@ -105,9 +159,7 @@ impl WifiController {
         );
         let ok = scheduler::queue_ready_thread(thread::IDLE, wifi_init);
         debug_assert_eq!(ok, Ok(()));
-        Self {
-            state: WifiState::Idle,
-        }
+        Self {}
     }
 
     fn apply_sta_config() -> Result<(), NetError> {
@@ -299,12 +351,13 @@ impl WifiOps for WifiController {
             wifi_scan_type_t_WIFI_SCAN_TYPE_PASSIVE
         };
 
+        mark_scan_results_pending();
         let ret = unsafe { esp_wifi_scan_start(&cfg as *const wifi_scan_config_t, false) };
         if ret != (ESP_OK as i32) {
+            mark_scan_results_unavailable();
             log::error!("Failed to start WiFi scan: error code {}", ret);
             Err(NetError::NoRoute)
         } else {
-            self.state = WifiState::Scanning;
             Ok(Vec::new())
         }
     }

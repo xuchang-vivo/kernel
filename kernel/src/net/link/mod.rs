@@ -40,7 +40,10 @@ pub(crate) mod medium;
 pub(crate) mod virtio;
 pub(crate) mod wifi_ops;
 
-use core::any::Any;
+use core::{
+    any::Any,
+    sync::atomic::{AtomicUsize, Ordering},
+};
 
 use alloc::{string::String, sync::Arc, vec::Vec};
 use core::fmt;
@@ -179,19 +182,46 @@ impl LinkRegistry {
 /// Global link registry instance.
 pub(crate) static LINK_REGISTRY: LinkRegistry = LinkRegistry::new();
 
-/// Global cache for the last WiFi scan results, populated by `WifiScan` and
-/// read by `SIOCGIWSCAN` (from `sockfs`).
+const WIFI_SCAN_CACHE_IDLE: usize = 0;
+const WIFI_SCAN_CACHE_SCANNING: usize = 1;
+const WIFI_SCAN_CACHE_READY: usize = 2;
+
+/// Global cache for WiFi scan results. The payload is populated by the WiFi
+/// driver's async ScanDone handler and read by `SIOCGIWSCAN` (from `sockfs`).
 static WIFI_SCAN_CACHE: spin::Mutex<Option<Vec<WifiScanResult>>> = spin::Mutex::new(None);
+static WIFI_SCAN_CACHE_STATE: AtomicUsize = AtomicUsize::new(WIFI_SCAN_CACHE_IDLE);
+
+/// Mark scan results as pending before starting a new async scan.
+pub(crate) fn mark_scan_results_pending() {
+    WIFI_SCAN_CACHE_STATE.store(WIFI_SCAN_CACHE_SCANNING, Ordering::Release);
+}
+
+/// Mark scan results as unavailable when starting the scan task fails.
+pub(crate) fn mark_scan_results_unavailable() {
+    WIFI_SCAN_CACHE_STATE.store(WIFI_SCAN_CACHE_IDLE, Ordering::Release);
+}
+
+/// Replace the global WiFi scan cache with the latest results.
+pub(crate) fn update_scan_results_cache(results: Vec<WifiScanResult>) {
+    *WIFI_SCAN_CACHE.lock() = Some(results);
+    WIFI_SCAN_CACHE_STATE.store(WIFI_SCAN_CACHE_READY, Ordering::Release);
+}
 
 /// Copy cached WiFi scan results into a user-space buffer.
 ///
 /// `buf` is a raw pointer to the user-space destination, `buf_len` is its
 /// capacity. Returns the number of bytes written on success, or `EINVAL` /
-/// `ENOSPC` on error.
+/// `EAGAIN` / `ENOSPC` on error.
 pub(crate) fn copy_scan_results_to_user(
     buf: *mut u8,
     buf_len: usize,
 ) -> Result<usize, crate::error::Error> {
+    match WIFI_SCAN_CACHE_STATE.load(Ordering::Acquire) {
+        WIFI_SCAN_CACHE_READY => {}
+        WIFI_SCAN_CACHE_SCANNING => return Err(crate::error::code::EAGAIN),
+        _ => return Err(crate::error::code::EINVAL),
+    }
+
     let cache = WIFI_SCAN_CACHE.lock();
     let results = cache.as_ref().ok_or(crate::error::code::EINVAL)?;
 
@@ -315,9 +345,6 @@ pub(crate) fn handle_control(cmd: NetIfaceControl) -> Result<NetIfaceResult, Net
             let results = wifi
                 .scan(config)
                 .map_err(|_| NetIfaceError::DeviceTraitNotAvailable)?;
-
-            // Populate global scan cache so SIOCGIWSCAN can retrieve the results.
-            *WIFI_SCAN_CACHE.lock() = Some(results.clone());
 
             Ok(NetIfaceResult::WifiScanResult(results))
         }

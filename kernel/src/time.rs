@@ -37,7 +37,10 @@ impl Tick {
     }
 
     pub fn from_micros(micros: u64) -> Self {
-        Self((micros * (TICKS_PER_SECOND as u64) / 1_000_000) as usize)
+        match micros.checked_mul(TICKS_PER_SECOND as u64) {
+            Some(v) => Self((v / 1_000_000) as usize),
+            None => Self::MAX,
+        }
     }
 
     pub fn as_micros(&self) -> u64 {

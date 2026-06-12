@@ -109,6 +109,7 @@ pub(crate) fn handle_intc_irq(ctx: &Context, mcause: usize, mtval: usize) {
     let cpu_id = arch::current_cpu_id();
     match mcause & 0xff {
         0 | 1 => {
+            #[cfg(enable_net)]
             super::wifi::os_adapter::ISR_INTERRUPT_1.dispatch();
         }
         TARGET0_INT_NUM => {

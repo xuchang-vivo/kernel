@@ -161,6 +161,7 @@ impl FileOps for SocketFile {
             return match copy_scan_results_to_user(buf_ptr, buf_len) {
                 Ok(n) => Ok(n as i32),
                 Err(code::ENOSPC) => Err(code::ENOSPC),
+                Err(code::EAGAIN) => Err(code::EAGAIN),
                 Err(_) => Err(code::EINVAL),
             };
         }

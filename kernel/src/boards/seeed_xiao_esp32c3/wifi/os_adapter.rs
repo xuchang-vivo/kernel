@@ -17,6 +17,7 @@
 // https://github.com/esp-rs/esp-hal/blob/b0ea8c5b58aa66281c1325112219de737dc446d8/LICENSE-APACHE
 
 use crate::{
+    arch,
     boards::{efuse::read_mac_address, get_device, random_u32, Handler},
     scheduler::{self, wait_queue, InsertToEnd, WaitEntry},
     sync::{mqueue::MessageQueue, SpinLock},
@@ -45,15 +46,11 @@ use esp_radio_rtos_driver::{
     wait_queue::{WaitQueueHandle, WaitQueueImplementation, WaitQueuePtr},
     SchedulerImplementation, ThreadPtr,
 };
-use esp_sync::{
-    raw::{RawLock, SingleCoreInterruptLock},
-    RawMutex,
-};
 use esp_wifi_sys_esp32c3::include::{
     esp_event_base_t, ets_timer, timeval, OSI_FUNCS_TIME_BLOCKING,
 };
 
-static WIFI_LOCK: RawMutex = RawMutex::new();
+use super::event::{EventInfo, WifiEvent};
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gettimeofday(tv: *mut timeval, _tz: *mut ()) -> i32 {
@@ -276,17 +273,15 @@ impl WaitQueueImplementation for EspWaitQueue {
     }
 }
 
-/// BkSemaphore: a semaphore implementation using SingleCoreInterruptLock instead of
-/// NonReentrantMutex. This avoids the "lock is not reentrant" panic that occurs when
-/// CompatSemaphore's NonReentrantMutex is held across a context switch inside
-/// EspWaitQueue::wait_until.
+/// BkSemaphore: a semaphore implementation using short interrupt-disabled critical
+/// sections instead of NonReentrantMutex. This avoids the "lock is not reentrant"
+/// panic that occurs when CompatSemaphore's NonReentrantMutex is held across a
+/// context switch inside EspWaitQueue::wait_until.
 ///
-/// SingleCoreInterruptLock only disables/re-enables interrupts (csrrci mstatus, 8 on RISC-V)
-/// with no reentry tracking. On single-core, interrupt disable is sufficient for mutual
-/// exclusion, and a context switch inside the critical section won't trigger a panic
-/// when another thread tries the same lock.
+/// On single-core, saving and disabling local interrupts is sufficient for mutual
+/// exclusion. Blocking waits must happen outside these critical sections so the
+/// scheduler sees local interrupts enabled when suspending and resuming threads.
 struct BkSemaphore {
-    lock: SingleCoreInterruptLock,
     data: UnsafeCell<SemaphoreBkData>,
 }
 
@@ -306,7 +301,6 @@ impl BkSemaphore {
             SemaphoreKind::Mutex | SemaphoreKind::RecursiveMutex => (1, 1),
         };
         BkSemaphore {
-            lock: SingleCoreInterruptLock,
             data: UnsafeCell::new(SemaphoreBkData {
                 kind,
                 current,
@@ -316,15 +310,11 @@ impl BkSemaphore {
         }
     }
 
-    /// Enter critical section, run `f`, then exit.  Mirrors how CompatSemaphore
-    /// uses `NonReentrantMutex::with()` — except SingleCoreInterruptLock
-    /// tracks no locked-state, so context switches inside the closure are safe.
-    fn with_irq_safe<R>(&self, f: impl FnOnce(&mut SemaphoreBkData, &Self) -> R) -> R {
-        // SAFETY: enter/exit are paired; token is valid only within this call.
-        let token = unsafe { self.lock.enter() };
-        let r = f(unsafe { &mut *self.data.get() }, self);
-        // SAFETY: token from the paired enter above.
-        unsafe { self.lock.exit(token) };
+    /// Enter a short critical section, run `f`, then restore the full saved IRQ state.
+    fn with_irq_safe<R>(&self, f: impl FnOnce(&mut SemaphoreBkData) -> R) -> R {
+        let irq_level = arch::disable_local_irq_save();
+        let r = f(unsafe { &mut *self.data.get() });
+        arch::enable_local_irq_restore(irq_level);
         r
     }
 }
@@ -338,7 +328,7 @@ impl SemaphoreImplementation for BkSemaphore {
     unsafe fn delete(semaphore: SemaphorePtr) {
         let sem = Box::from_raw(semaphore.cast::<Self>().as_ptr());
         // Delete the wait queue — no lock needed, nobody references this any more.
-        EspWaitQueue::delete(sem.with_irq_safe(|d, _| d.waiting));
+        EspWaitQueue::delete(sem.with_irq_safe(|d| d.waiting));
         drop(sem);
     }
 
@@ -352,40 +342,48 @@ impl SemaphoreImplementation for BkSemaphore {
     unsafe fn take_with_deadline(semaphore: SemaphorePtr, _deadline_instant: Option<u64>) -> bool {
         let sem = &*semaphore.cast::<BkSemaphore>().as_ptr();
         loop {
-            // Quick path: try to decrement current under interrupt-disable.
+            // Quick path: try to decrement current under a short critical section.
             // If semaphore is available, take it and return immediately.
-            let available = sem.with_irq_safe(|data, _| {
-                if data.current > 0 {
+            // If we need to block, the wait happens after with_irq_safe restores the
+            // saved IRQ state.
+            let (available, waiting) = sem.with_irq_safe(|data| {
+                let available = if data.current > 0 {
                     data.current -= 1;
                     true
                 } else {
                     false
-                }
+                };
+                (available, data.waiting)
             });
+
             if available {
                 return true;
             }
 
             // Semaphore not available — need to block.
-            // wait_until handles insert + suspend + pop atomically (via with_iou!),
-            // and the context switch inside suspend_me_until must happen with
-            // interrupts enabled (scheduler asserts local_irq_enabled after resume).
-            // So we do NOT hold SingleCoreInterruptLock across the suspend call.
+            // wait_until handles insert + suspend + pop atomically (via with_iou!).
+            // ESP Wi-Fi may call this while its upstream critical section has local
+            // IRQ disabled. BlueOS cannot context-switch with local IRQ disabled, so
+            // bridge the two contracts: save the caller's IRQ state, enable IRQ only
+            // for the blocking wait, then restore the saved state after wait returns.
             if _deadline_instant.is_some_and(|d| Tick::now().as_micros() >= d) {
                 return false;
             }
+            let irq_level = arch::disable_local_irq_save();
+            arch::enable_local_irq();
+            // SAFETY: `waiting` pointer is immutable after new() — it is only
+            // read here and in give().  `waiting` was already captured under the
+            // guard above, so we use the local copy.
             unsafe {
-                EspWaitQueue::wait_until(
-                    sem.with_irq_safe(|data, _| data.waiting),
-                    _deadline_instant,
-                );
+                EspWaitQueue::wait_until(waiting, _deadline_instant);
             }
+            arch::enable_local_irq_restore(irq_level);
         }
     }
 
     unsafe fn give(semaphore: SemaphorePtr) -> bool {
         let sem = &*semaphore.cast::<BkSemaphore>().as_ptr();
-        sem.with_irq_safe(|data, _| {
+        sem.with_irq_safe(|data| {
             if data.current < data.max {
                 data.current += 1;
                 unsafe { EspWaitQueue::notify(data.waiting) };
@@ -401,7 +399,7 @@ impl SemaphoreImplementation for BkSemaphore {
         higher_prio_task_waken: Option<&mut bool>,
     ) -> bool {
         let sem = &*semaphore.cast::<BkSemaphore>().as_ptr();
-        sem.with_irq_safe(|data, _| {
+        sem.with_irq_safe(|data| {
             if data.current < data.max {
                 data.current += 1;
                 unsafe {
@@ -416,12 +414,12 @@ impl SemaphoreImplementation for BkSemaphore {
 
     unsafe fn current_count(semaphore: SemaphorePtr) -> u32 {
         let sem = &*semaphore.cast::<BkSemaphore>().as_ptr();
-        sem.with_irq_safe(|data, _| data.current)
+        sem.with_irq_safe(|data| data.current)
     }
 
     unsafe fn try_take(semaphore: SemaphorePtr) -> bool {
         let sem = &*semaphore.cast::<BkSemaphore>().as_ptr();
-        sem.with_irq_safe(|data, _| {
+        sem.with_irq_safe(|data| {
             if data.current > 0 {
                 data.current -= 1;
                 true
@@ -491,15 +489,38 @@ pub unsafe extern "C" fn spin_lock_create() -> *mut c_void {
     semphr_create(1, 1)
 }
 
+/// INTC `cpu_int_enable_reg` offset for ESP32-C3.
+const INTC_CPU_INT_ENABLE: *mut u32 = (0x600c_2000 + 0x104) as *mut u32;
+
+/// Bitmask for the two wifi interrupt sources (interrupts 0 and 1, which
+/// correspond to mcause bits 0|1 in `handle_intc_irq`).
+const WIFI_IRQ_MASK: u32 = 0b11;
+
+/// Re-implementation of `wifi_int_disable` that masks only the wifi interrupt
+/// sources (INTC IRQ 0 and 1) instead of globally disabling MIE.
+///
+/// This avoids the MIE=0 leak through `take_with_deadline` →
+/// `suspend_me_until` → `debug_assert!(arch::local_irq_enabled())` crash when
+/// the async handler calls C APIs (e.g. `esp_wifi_scan_get_ap_records`) that
+/// internally hold this lock.
 pub unsafe extern "C" fn wifi_int_disable(_wifi_int_mux: *mut c_void) -> u32 {
-    // TODO: can we use wifi_int_mux?
-    let token = unsafe { WIFI_LOCK.acquire() };
-    unsafe { core::mem::transmute::<esp_sync::RestoreState, u32>(token) }
+    let old = unsafe { INTC_CPU_INT_ENABLE.read_volatile() };
+    unsafe { INTC_CPU_INT_ENABLE.write_volatile(old & !WIFI_IRQ_MASK) };
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    log::trace!(
+        "wifi_int_disable: INTC enable reg {:#x} -> {:#x}",
+        old,
+        old & !WIFI_IRQ_MASK
+    );
+    old
 }
 
 pub unsafe extern "C" fn wifi_int_restore(_wifi_int_mux: *mut c_void, tmp: u32) {
-    let token = unsafe { core::mem::transmute::<u32, esp_sync::RestoreState>(tmp) };
-    unsafe { WIFI_LOCK.release(token) }
+    let old = unsafe { INTC_CPU_INT_ENABLE.read_volatile() };
+    let new = (old & !WIFI_IRQ_MASK) | (tmp & WIFI_IRQ_MASK);
+    unsafe { INTC_CPU_INT_ENABLE.write_volatile(new) };
+    core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+    log::trace!("wifi_int_restore: INTC enable reg {:#x} -> {:#x}", old, new);
 }
 
 pub unsafe extern "C" fn task_yield_from_isr() {
@@ -828,14 +849,20 @@ pub unsafe extern "C" fn event_post(
 ) -> i32 {
     use num_traits::FromPrimitive;
 
-    if let Some(event) = crate::boards::wifi::event::WifiEvent::from_i32(event_id) {
-        log::debug!("Event: {:?}", event);
-
-        if let Some(payload) = super::event::EventInfo::from_wifi_event_raw(event, event_data) {
-            log::debug!("Event payload: {:?}", payload);
-        }
-    } else {
+    let Some(event) = WifiEvent::from_i32(event_id) else {
         log::warn!("Unknown event id: {}", event_id);
+        return 0;
+    };
+    log::debug!("Event: {:?}", event);
+
+    let Some(payload) = super::event::EventInfo::from_wifi_event_raw(event, event_data) else {
+        return 0;
+    };
+    log::debug!("Event payload: {:?}", payload);
+
+    // Forward to async handler only; payload processing stays in async context.
+    if let Err(e) = unsafe { super::EVENT_SENDER.assume_init_mut() }.try_send(payload) {
+        log::warn!("Event channel full, dropping event: {:?}", e.0);
     }
     0
 }
