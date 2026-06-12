@@ -163,8 +163,11 @@ impl<T, const N: usize> ChanInner<T, N> {
         self.len() >= N
     }
 
-    /// Attempt a send. Returns `Err(val)` if full.
+    /// Attempt a send. Returns `Err(val)` if full or disconnected.
     pub(crate) fn try_send(&self, val: T) -> Result<(), T> {
+        if self.is_disconnected() {
+            return Err(val);
+        }
         let head = self.head.load(Ordering::Relaxed);
         let tail = self.tail.load(Ordering::Acquire);
         if head.wrapping_sub(tail) >= N {
@@ -490,4 +493,165 @@ impl<T, const N: usize> Future for RecvFuture<'_, T, N> {
 /// Create a new SPSC channel and split into `(Sender, Receiver)`.
 pub fn channel<T, const N: usize>() -> (Sender<T, N>, Receiver<T, N>) {
     AsyncChannel::new().split()
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use blueos_test_macro::test;
+
+    use crate::asynk;
+
+    use super::*;
+
+    /// Non-blocking try_send / try_recv, verify every received value.
+    #[test]
+    fn test_try_send_recv() {
+        const CAP: usize = 4;
+        let (tx, rx) = channel::<u32, CAP>();
+
+        for i in 0..CAP {
+            assert!(tx.try_send(i as u32).is_ok());
+        }
+        assert!(tx.try_send(99).is_err());
+
+        for i in 0..CAP {
+            let v = rx.try_recv().unwrap();
+            assert_eq!(v, i as u32);
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// Blocking send/recv, verify every value.
+    #[test]
+    fn test_send_blocking_recv_blocking() {
+        const CAP: usize = 8;
+        let (tx, rx) = channel::<u64, CAP>();
+
+        for i in 0..CAP {
+            tx.send_blocking(i as u64).unwrap();
+        }
+        for i in 0..CAP {
+            let v = rx.recv_blocking().unwrap();
+            assert_eq!(v, i as u64);
+        }
+    }
+
+    /// Drop sender: receiver can drain remaining items, then gets error.
+    #[test]
+    fn test_disconnect_sender() {
+        let (tx, rx) = channel::<u32, 4>();
+        tx.try_send(10).unwrap();
+        tx.try_send(20).unwrap();
+
+        drop(tx);
+
+        assert_eq!(rx.recv_blocking().unwrap(), 10);
+        assert_eq!(rx.recv_blocking().unwrap(), 20);
+        assert!(rx.recv_blocking().is_err());
+        assert!(rx.try_recv().is_err());
+    }
+
+    /// Drop receiver: sender gets error.
+    #[test]
+    fn test_disconnect_receiver() {
+        let (tx, rx) = channel::<u32, 4>();
+        drop(rx);
+        assert!(tx.send_blocking(42).is_err());
+        assert!(tx.try_send(42).is_err());
+    }
+
+    /// Async send/recv via block_on, verify every value.
+    #[test]
+    fn test_async_send_recv() {
+        const CAP: usize = 4;
+        let (tx, rx) = channel::<u32, CAP>();
+
+        for i in 0..CAP {
+            tx.send_blocking(i as u32).unwrap();
+        }
+
+        asynk::block_on(async move {
+            let v0 = rx.recv().await.unwrap();
+            assert_eq!(v0, 0);
+            tx.send(v0).await.unwrap();
+
+            let v1 = rx.recv().await.unwrap();
+            assert_eq!(v1, 1);
+            let v2 = rx.recv().await.unwrap();
+            assert_eq!(v2, 2);
+            let v3 = rx.recv().await.unwrap();
+            assert_eq!(v3, 3);
+            let v0_back = rx.recv().await.unwrap();
+            assert_eq!(v0_back, 0);
+        });
+    }
+
+    /// Async recv after sender drops.
+    #[test]
+    fn test_async_disconnect() {
+        let (tx, rx) = channel::<u32, 4>();
+        tx.send_blocking(100).unwrap();
+        tx.send_blocking(200).unwrap();
+        drop(tx);
+
+        asynk::block_on(async move {
+            let v1 = rx.recv().await.unwrap();
+            assert_eq!(v1, 100);
+            let v2 = rx.recv().await.unwrap();
+            assert_eq!(v2, 200);
+            assert!(rx.recv().await.is_err());
+        });
+    }
+
+    /// Explicit close via sender.
+    #[test]
+    fn test_sender_close() {
+        let (tx, rx) = channel::<u32, 4>();
+        tx.try_send(77).unwrap();
+        tx.close();
+
+        assert_eq!(rx.recv_blocking().unwrap(), 77);
+        assert!(rx.recv_blocking().is_err());
+        assert!(tx.send_blocking(88).is_err());
+    }
+
+    /// Explicit close via receiver.
+    #[test]
+    fn test_receiver_close() {
+        let (tx, rx) = channel::<u32, 4>();
+        rx.close();
+        assert!(tx.send_blocking(99).is_err());
+    }
+
+    /// Ring-buffer wrap-around: multiple fill-drain cycles.
+    #[test]
+    fn test_wrap_around() {
+        const CAP: usize = 4;
+        let (tx, rx) = channel::<i32, CAP>();
+
+        for cycle in 0..8 {
+            for i in 0..CAP {
+                tx.send_blocking((cycle * CAP + i) as i32).unwrap();
+            }
+            for i in 0..CAP {
+                let v = rx.recv_blocking().unwrap();
+                assert_eq!(v, (cycle * CAP + i) as i32);
+            }
+        }
+    }
+
+    /// After disconnect, try_send returns the original value.
+    #[test]
+    fn test_send_after_disconnect() {
+        let (tx, rx) = channel::<u32, 4>();
+        drop(rx);
+
+        let err = tx.try_send(7).unwrap_err();
+        assert_eq!(err.0, 7);
+        assert!(tx.send_blocking(8).is_err());
+    }
 }
