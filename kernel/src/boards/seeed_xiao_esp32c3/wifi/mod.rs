@@ -43,19 +43,20 @@ use core::{
 use esp_hal as hal;
 use esp_wifi_sys_esp32c3::include::{
     __BindgenBitfieldUnit, esp_event_base_t, esp_interface_t_ESP_IF_WIFI_AP,
-    esp_interface_t_ESP_IF_WIFI_STA, esp_supplicant_init, esp_wifi_init_internal,
-    esp_wifi_internal_reg_rxcb, esp_wifi_scan_get_ap_num, esp_wifi_scan_get_ap_records,
-    esp_wifi_scan_start, esp_wifi_set_config, esp_wifi_set_country, esp_wifi_set_mode,
-    esp_wifi_set_protocols, esp_wifi_set_ps, esp_wifi_set_tx_done_cb, esp_wifi_start,
-    g_wifi_default_wpa_crypto_funcs, wifi_ap_record_t, wifi_auth_mode_t_WIFI_AUTH_WPA2_PSK,
-    wifi_config_t, wifi_country_policy_t_WIFI_COUNTRY_POLICY_MANUAL, wifi_country_t,
-    wifi_init_config_t, wifi_interface_t_WIFI_IF_STA, wifi_mode_t_WIFI_MODE_NULL,
-    wifi_mode_t_WIFI_MODE_STA, wifi_osi_funcs_t, wifi_pmf_config_t, wifi_protocols_t,
-    wifi_ps_type_t_WIFI_PS_NONE, wifi_scan_config_t, wifi_scan_threshold_t,
-    wifi_scan_type_t_WIFI_SCAN_TYPE_ACTIVE, wifi_scan_type_t_WIFI_SCAN_TYPE_PASSIVE,
-    wifi_sort_method_t_WIFI_CONNECT_AP_BY_SIGNAL, wifi_sta_config_t, ESP_OK,
-    ESP_WIFI_OS_ADAPTER_MAGIC, ESP_WIFI_OS_ADAPTER_VERSION, WIFI_ENABLE_ENTERPRISE,
-    WIFI_ENABLE_WPA3_SAE, WIFI_INIT_CONFIG_MAGIC,
+    esp_interface_t_ESP_IF_WIFI_STA, esp_supplicant_init, esp_wifi_connect_internal,
+    esp_wifi_disconnect_internal,
+    esp_wifi_init_internal, esp_wifi_internal_reg_rxcb, esp_wifi_scan_get_ap_num,
+    esp_wifi_scan_get_ap_records, esp_wifi_scan_start, esp_wifi_set_config, esp_wifi_set_country,
+    esp_wifi_set_mode, esp_wifi_set_protocols, esp_wifi_set_ps, esp_wifi_set_tx_done_cb,
+    esp_wifi_start, g_wifi_default_wpa_crypto_funcs, wifi_ap_record_t,
+    wifi_auth_mode_t_WIFI_AUTH_WPA2_PSK, wifi_config_t,
+    wifi_country_policy_t_WIFI_COUNTRY_POLICY_MANUAL, wifi_country_t, wifi_init_config_t,
+    wifi_interface_t_WIFI_IF_STA, wifi_mode_t_WIFI_MODE_NULL, wifi_mode_t_WIFI_MODE_STA,
+    wifi_osi_funcs_t, wifi_pmf_config_t, wifi_protocols_t, wifi_ps_type_t_WIFI_PS_NONE,
+    wifi_scan_config_t, wifi_scan_threshold_t, wifi_scan_type_t_WIFI_SCAN_TYPE_ACTIVE,
+    wifi_scan_type_t_WIFI_SCAN_TYPE_PASSIVE, wifi_sort_method_t_WIFI_CONNECT_AP_BY_SIGNAL,
+    wifi_sta_config_t, ESP_OK, ESP_WIFI_OS_ADAPTER_MAGIC, ESP_WIFI_OS_ADAPTER_VERSION,
+    WIFI_ENABLE_ENTERPRISE, WIFI_ENABLE_WPA3_SAE, WIFI_INIT_CONFIG_MAGIC,
 };
 use event::EventInfo;
 use libc::IW_SCAN_TYPE_ACTIVE;
@@ -363,15 +364,74 @@ impl WifiOps for WifiController {
     }
 
     fn connect(&mut self, ssid: &str, passphrase: &str) -> Result<(), NetError> {
-        todo!()
+        log::info!("WiFi connecting to SSID: {} (passphrase len: {})", ssid, passphrase.len());
+
+        unsafe {
+            let mut cfg: wifi_config_t = core::mem::zeroed();
+
+            // Copy SSID
+            let ssid_bytes = ssid.as_bytes();
+            let ssid_len = core::cmp::min(ssid_bytes.len(), 32);
+            cfg.sta.ssid[..ssid_len].copy_from_slice(&ssid_bytes[..ssid_len]);
+
+            // Copy passphrase
+            let pwd_bytes = passphrase.as_bytes();
+            let pwd_len = core::cmp::min(pwd_bytes.len(), 64);
+            cfg.sta.password[..pwd_len].copy_from_slice(&pwd_bytes[..pwd_len]);
+
+            cfg.sta.scan_method = 0; // WIFI_FAST_SCAN
+            cfg.sta.bssid_set = false;
+            cfg.sta.channel = 0;
+            cfg.sta.listen_interval = 3;
+            cfg.sta.sort_method = wifi_sort_method_t_WIFI_CONNECT_AP_BY_SIGNAL;
+            cfg.sta.threshold.rssi = -99;
+            cfg.sta.threshold.authmode = if passphrase.is_empty() {
+                esp_wifi_sys_esp32c3::include::wifi_auth_mode_t_WIFI_AUTH_OPEN
+            } else {
+                wifi_auth_mode_t_WIFI_AUTH_WPA2_PSK
+            };
+            cfg.sta.threshold.rssi_5g_adjustment = 0;
+            cfg.sta.pmf_cfg.capable = true;
+            cfg.sta.pmf_cfg.required = false;
+            cfg.sta.sae_pwe_h2e = 3;
+            cfg.sta.failure_retry_cnt = 1;
+            cfg.sta.sae_pk_mode = 0;
+
+            let ret = esp_wifi_set_config(
+                esp_interface_t_ESP_IF_WIFI_STA,
+                &cfg as *const wifi_config_t as *mut wifi_config_t,
+            );
+            if ret != (ESP_OK as i32) {
+                log::error!("WiFi connect: esp_wifi_set_config failed: {}", ret);
+                return Err(NetError::NoRoute);
+            }
+
+            let ret = esp_wifi_connect_internal();
+            if ret != (ESP_OK as i32) {
+                log::error!("WiFi connect: esp_wifi_connect_internal failed: {}", ret);
+                return Err(NetError::NoRoute);
+            }
+        }
+
+        log::info!("WiFi connect triggered for SSID: {}", ssid);
+        Ok(())
     }
 
     fn disconnect(&mut self) -> Result<(), NetError> {
-        todo!()
+        log::info!("WiFi disconnecting");
+        unsafe {
+            let ret = esp_wifi_disconnect_internal();
+            if ret != (ESP_OK as i32) {
+                log::error!("WiFi disconnect: esp_wifi_disconnect_internal failed: {}", ret);
+                return Err(NetError::NoRoute);
+            }
+        }
+        Ok(())
     }
 
     fn signal_strength(&self) -> Result<i8, NetError> {
-        todo!()
+        // TODO: read RSSI from the connected AP
+        Ok(-40)
     }
 }
 

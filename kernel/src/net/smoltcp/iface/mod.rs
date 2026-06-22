@@ -223,6 +223,7 @@ impl NetIface {
             // WiFi operations are dispatched via the link-layer `handle_control`
             // path (link/mod.rs), not through smoltcp `NetIface::control()`.
             NetIfaceControl::WifiScan(_)
+            | NetIfaceControl::WifiPassphrase(_)
             | NetIfaceControl::WifiConnect { .. }
             | NetIfaceControl::WifiDisconnect
             | NetIfaceControl::WifiSignalStrength => {

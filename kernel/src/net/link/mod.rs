@@ -191,6 +191,10 @@ const WIFI_SCAN_CACHE_READY: usize = 2;
 static WIFI_SCAN_CACHE: spin::Mutex<Option<Vec<WifiScanResult>>> = spin::Mutex::new(None);
 static WIFI_SCAN_CACHE_STATE: AtomicUsize = AtomicUsize::new(WIFI_SCAN_CACHE_IDLE);
 
+/// Global cache for the WiFi passphrase, set by SIOCSIWENCODE and consumed by
+/// the subsequent SIOCSIWESSID (WifiConnect) ioctl.
+static WIFI_PASSPHRASE_CACHE: spin::Mutex<Option<String>> = spin::Mutex::new(None);
+
 /// Mark scan results as pending before starting a new async scan.
 pub(crate) fn mark_scan_results_pending() {
     WIFI_SCAN_CACHE_STATE.store(WIFI_SCAN_CACHE_SCANNING, Ordering::Release);
@@ -347,6 +351,63 @@ pub(crate) fn handle_control(cmd: NetIfaceControl) -> Result<NetIfaceResult, Net
                 .map_err(|_| NetIfaceError::DeviceTraitNotAvailable)?;
 
             Ok(NetIfaceResult::WifiScanResult(results))
+        }
+        // ── WiFi passphrase cache (SIOCSIWENCODE) ──
+        NetIfaceControl::WifiPassphrase(ref passphrase) => {
+            *WIFI_PASSPHRASE_CACHE.lock() = Some(passphrase.clone());
+            Ok(NetIfaceResult::Void)
+        }
+        // ── WiFi connect (SIOCSIWESSID) ──
+        NetIfaceControl::WifiConnect { ref ifname, ref ssid } => {
+            let ifname = ifname
+                .iter()
+                .take_while(|&&b| b != 0)
+                .copied()
+                .collect::<alloc::vec::Vec<u8>>();
+            let ifname = core::str::from_utf8(&ifname).unwrap_or("");
+            let link_arc = LINK_REGISTRY
+                .find_by_name(ifname)
+                .ok_or(NetIfaceError::DeviceNotFound)?;
+            let mut link = link_arc.write();
+            let wifi = link
+                .as_wifi()
+                .ok_or(NetIfaceError::DeviceTraitNotAvailable)?;
+
+            let passphrase = WIFI_PASSPHRASE_CACHE
+                .lock()
+                .take()
+                .unwrap_or_default();
+
+            wifi.connect(ssid, &passphrase)
+                .map_err(|_| NetIfaceError::DeviceTraitNotAvailable)?;
+
+            Ok(NetIfaceResult::Void)
+        }
+        // ── WiFi disconnect ──
+        NetIfaceControl::WifiDisconnect => {
+            let link_arc = LINK_REGISTRY.get(0).ok_or(NetIfaceError::DeviceNotFound)?;
+            let mut link = link_arc.write();
+            let wifi = link
+                .as_wifi()
+                .ok_or(NetIfaceError::DeviceTraitNotAvailable)?;
+            wifi.disconnect()
+                .map_err(|_| NetIfaceError::DeviceTraitNotAvailable)?;
+            Ok(NetIfaceResult::Void)
+        }
+        // ── WiFi signal strength ──
+        NetIfaceControl::WifiSignalStrength => {
+            let link_arc = LINK_REGISTRY.get(0).ok_or(NetIfaceError::DeviceNotFound)?;
+            let link = link_arc.read();
+            // We need &mut for as_wifi, so use write lock
+            drop(link);
+            let mut link = link_arc.write();
+            let wifi = link
+                .as_wifi()
+                .ok_or(NetIfaceError::DeviceTraitNotAvailable)?;
+            let rssi = wifi
+                .signal_strength()
+                .map_err(|_| NetIfaceError::DeviceTraitNotAvailable)?;
+            Ok(NetIfaceResult::WifiSignalStrength(rssi))
         }
         _ => Err(NetIfaceError::NotSupported),
     }
