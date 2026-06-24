@@ -270,3 +270,17 @@ run_qemu_check("run_unittest") {
 static_library("atomic") {
   sources = [ "src/sync/libatomic/atomic.c" ]
 }
+
+static_library("wifi_log_bridge") {
+  sources = [ "src/boards/seeed_xiao_esp32c3/wifi/log_bridge.c" ]
+  cflags = [
+    "--static",
+    "-fshort-enums",
+    "-fsigned-char",
+    "-nostdlib",
+    "-isystem",
+    exec_script("//build/scripts/get_sysroot.py",
+                [ "riscv-none-elf-gcc" ],
+                "string") + "/include",
+  ]
+}

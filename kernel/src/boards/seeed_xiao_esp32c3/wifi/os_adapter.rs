@@ -21,7 +21,7 @@ use crate::{
     boards::{efuse::read_mac_address, get_device, random_u32, Handler},
     scheduler::{self, wait_queue, InsertToEnd, WaitEntry},
     sync::{mqueue::MessageQueue, SpinLock},
-    thread::{Entry, Stack, SUSPENDED},
+    thread::{Entry, Stack, ThreadNode, SUSPENDED},
     time::Tick,
     types::{Arc, ThreadPriority},
     with_iou,
@@ -32,7 +32,7 @@ use core::{
     cell::UnsafeCell,
     ffi::{c_char, c_uint, c_void},
     ptr::NonNull,
-    sync::atomic::{AtomicU32, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
 use esp_radio_rtos_driver::{
     queue::{CompatQueue, QueueHandle, QueuePtr},
@@ -51,6 +51,89 @@ use esp_wifi_sys_esp32c3::include::{
 };
 
 use super::event::{EventInfo, WifiEvent};
+
+extern "C" {
+    static mut g_ic: u8;
+}
+
+fn wake_null_timer_addr() -> u32 {
+    unsafe { core::ptr::addr_of!(g_ic).add(0x1dec) as u32 }
+}
+
+static WIFI_OS_WAIT_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+static WIFI_OS_NOTIFY_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+static WIFI_OS_SEM_PI_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+static WIFI_OS_QUEUE_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+static WIFI_OS_TASK_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+static WIFI_OS_TIMER_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+static WIFI_OS_TIMER_ARM_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+static WIFI_TIMER_BACKEND_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+static WIFI_OS_PP_QUEUE: AtomicU32 = AtomicU32::new(0);
+static WIFI_OS_PENDING_YIELD: AtomicBool = AtomicBool::new(false);
+
+const WIFI_OS_DIAG_LOG_ENABLED: bool = false;
+const WIFI_TIMER_DIAG_LOG_ENABLED: bool = false;
+
+fn wifi_os_diag_log_enabled() -> bool {
+    WIFI_OS_DIAG_LOG_ENABLED
+}
+
+fn wifi_timer_diag_log_enabled() -> bool {
+    WIFI_TIMER_DIAG_LOG_ENABLED
+}
+
+fn wifi_os_should_log(counter: &AtomicU32) -> Option<u32> {
+    if !wifi_os_diag_log_enabled() {
+        return None;
+    }
+
+    let count = counter.fetch_add(1, Ordering::Relaxed);
+    if count < 64 || count.is_power_of_two() {
+        Some(count)
+    } else {
+        None
+    }
+}
+
+fn wifi_os_next_log_count(counter: &AtomicU32) -> u32 {
+    counter.fetch_add(1, Ordering::Relaxed)
+}
+
+fn wifi_os_log_count_enabled(count: u32) -> bool {
+    wifi_os_diag_log_enabled() && (count < 64 || count.is_power_of_two())
+}
+
+fn semaphore_kind_name(kind: &SemaphoreKind) -> &'static str {
+    match kind {
+        SemaphoreKind::Counting { .. } => "counting",
+        SemaphoreKind::Mutex => "mutex",
+        SemaphoreKind::RecursiveMutex => "recursive_mutex",
+    }
+}
+
+#[no_mangle]
+unsafe extern "Rust" fn blueos_wifi_timer_diag(event: u32, a: usize, b: u64, c: u64, d: u64) {
+    if !wifi_timer_diag_log_enabled() {
+        return;
+    }
+
+    let count = wifi_os_next_log_count(&WIFI_TIMER_BACKEND_LOG_COUNT);
+    let should_log = wifi_os_log_count_enabled(count)
+        || matches!(event, 10 | 11 | 12) && b >= 1_000_000
+        || matches!(event, 5 | 6 | 7);
+    if should_log {
+        log::info!(
+            "[WIFI_TIMER] diag#{} event={} a=0x{:08x} b={} c={} d={} now_us={}",
+            count,
+            event,
+            a,
+            b,
+            c,
+            d,
+            Tick::now().as_micros(),
+        );
+    }
+}
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn gettimeofday(tv: *mut timeval, _tz: *mut ()) -> i32 {
@@ -99,6 +182,20 @@ pub(crate) unsafe extern "C" fn sleep(seconds: c_uint) -> c_uint {
     0
 }
 
+fn yield_me_now_or_later_irq_safe() {
+    if crate::irq::is_in_irq() || arch::local_irq_enabled() {
+        scheduler::yield_me_now_or_later();
+    } else {
+        WIFI_OS_PENDING_YIELD.store(true, Ordering::Release);
+    }
+}
+
+pub(super) fn flush_pending_yield_if_safe() {
+    if arch::local_irq_enabled() && WIFI_OS_PENDING_YIELD.swap(false, Ordering::AcqRel) {
+        scheduler::yield_me_now_or_later();
+    }
+}
+
 struct BkScheduler;
 
 impl SchedulerImplementation for BkScheduler {
@@ -111,7 +208,7 @@ impl SchedulerImplementation for BkScheduler {
     }
 
     fn yield_task_from_isr(&self) {
-        crate::scheduler::yield_me_now_or_later();
+        yield_me_now_or_later_irq_safe();
     }
 
     fn max_task_priority(&self) -> u32 {
@@ -135,12 +232,32 @@ impl SchedulerImplementation for BkScheduler {
         // FreeRTOS priority is inverted relative to BlueOS: higher numeric value
         // means higher priority in FreeRTOS, but lower numeric value means higher
         // priority in BlueOS. Invert: blueos_prio = MAX - freertos_prio.
-        let blueos_prio = crate::config::MAX_THREAD_PRIORITY
+        let mut blueos_prio = crate::config::MAX_THREAD_PRIORITY
             .saturating_sub(priority.min(crate::config::MAX_THREAD_PRIORITY));
+        if _name == "timer" {
+            // The ESP timer service drives Wi-Fi scan dwell timeouts. If it stays
+            // below the Wi-Fi task, a scan timer wake can leave the timer task READY
+            // but unscheduled, stalling scan completion before association starts.
+            blueos_prio = blueos_prio.min(1);
+        }
         let thread = crate::thread::Builder::new(entry)
             .set_stack(stack)
             .set_priority(blueos_prio as ThreadPriority)
             .start();
+        if let Some(count) = wifi_os_should_log(&WIFI_OS_TASK_LOG_COUNT) {
+            log::info!(
+                "[WIFI_OS] task_create#{} name={} task=0x{:08x} param={:p} freertos_prio={} blueos_prio={} stack={} thread=0x{:08x} now_us={}",
+                count,
+                _name,
+                task as usize,
+                param,
+                priority,
+                blueos_prio,
+                task_stack_size,
+                Arc::as_ptr(&thread) as usize,
+                Tick::now().as_micros(),
+            );
+        }
         // into_raw consumes the Arc without decrementing refcount,
         // so the pointer retains ownership of one reference until
         // schedule_task_deletion reclaims it via Arc::from_raw.
@@ -221,12 +338,12 @@ impl SchedulerImplementation for BkScheduler {
 /// The kernel's `WaitQueue` (`Ilist<WaitEntry, OffsetOfWait>`) is an intrusive linked list.
 /// We wrap it in a `SpinLock` for thread safety, heap-allocate it, and expose it as an opaque
 /// `WaitQueuePtr` to the esp-radio layer.
-struct EspWaitQueue(wait_queue::WaitQueue);
+struct EspWaitQueue(SpinLock<wait_queue::WaitQueue>);
 
 impl WaitQueueImplementation for EspWaitQueue {
     fn create() -> WaitQueuePtr {
-        let mut wq = Box::new(EspWaitQueue(wait_queue::WaitQueue::new()));
-        wq.0.init();
+        let wq = Box::new(EspWaitQueue(SpinLock::new(wait_queue::WaitQueue::new())));
+        wq.0.irqsave_lock().init();
         let ptr = Box::into_raw(wq);
         NonNull::new(ptr as *mut ()).unwrap()
     }
@@ -240,36 +357,142 @@ impl WaitQueueImplementation for EspWaitQueue {
         let this = &mut *(queue.as_ptr() as *mut EspWaitQueue);
         let this_thread = scheduler::current_thread();
         let deadline = deadline_instant.map(Tick::from_micros).unwrap_or(Tick::MAX);
+        if let Some(count) = wifi_os_should_log(&WIFI_OS_WAIT_LOG_COUNT) {
+            log::info!(
+                "[WIFI_OS] wait_enter#{} queue={:p} deadline_us={:?} now_us={}",
+                count,
+                queue.as_ptr(),
+                deadline_instant,
+                Tick::now().as_micros(),
+            );
+        }
+        let mut w = this.0.irqsave_lock();
         with_iou!(|borrowed_wait_entry| {
             let mut wait_entry = WaitEntry::new(this_thread.clone());
             borrowed_wait_entry =
-                wait_queue::insert(&mut this.0, &mut wait_entry, InsertToEnd::MODE).unwrap();
-            let _ = scheduler::suspend_me_until::<()>(deadline, None);
-            borrowed_wait_entry = this.0.pop(borrowed_wait_entry).unwrap();
+                wait_queue::insert(&mut w, &mut wait_entry, InsertToEnd::MODE).unwrap();
+            let _ = scheduler::suspend_me_until(deadline, Some(w));
+            w = this.0.irqsave_lock();
+            borrowed_wait_entry = w.pop(borrowed_wait_entry).unwrap();
         });
+        if let Some(count) = wifi_os_should_log(&WIFI_OS_WAIT_LOG_COUNT) {
+            log::info!(
+                "[WIFI_OS] wait_exit#{} queue={:p} deadline_us={:?} now_us={}",
+                count,
+                queue.as_ptr(),
+                deadline_instant,
+                Tick::now().as_micros(),
+            );
+        }
     }
 
     unsafe fn notify(queue: WaitQueuePtr) {
         let this = &*(queue.as_ptr() as *const EspWaitQueue);
-        // Wake the first waiter (entries are appended to end, so first = oldest waiter).
-        if let Some(entry) = this.0.iter().next() {
-            let t = entry.thread.clone();
-            let _ = scheduler::queue_ready_thread(SUSPENDED, t);
-        }
-        // scheduler::yield_me();
-    }
-
-    unsafe fn notify_from_isr(queue: WaitQueuePtr, higher_prio_task_waken: Option<&mut bool>) {
-        let this = &*(queue.as_ptr() as *const EspWaitQueue);
-        if let Some(entry) = this.0.iter().next() {
-            let t = entry.thread.clone();
-            if scheduler::queue_ready_thread(SUSPENDED, t).is_ok() {
-                if let Some(hptw) = higher_prio_task_waken {
-                    *hptw = true;
-                }
+        let mut w = this.0.irqsave_lock();
+        let mut woke = false;
+        let mut waiters = 0usize;
+        let mut first_thread = 0usize;
+        let mut first_state_before = u8::MAX;
+        let mut first_state_after = u8::MAX;
+        for entry in w.iter() {
+            waiters += 1;
+            if waiters == 1 {
+                let t = entry.thread.clone();
+                first_thread = Arc::as_ptr(&t) as usize;
+                first_state_before = t.state();
+                woke = scheduler::queue_ready_thread(SUSPENDED, t.clone()).is_ok();
+                first_state_after = t.state();
             }
         }
-        // scheduler::yield_me_now_or_later();
+        drop(w);
+        let count = wifi_os_next_log_count(&WIFI_OS_NOTIFY_LOG_COUNT);
+        let schedule_ready = scheduler::is_schedule_ready();
+        let current = scheduler::current_thread();
+        let current_thread = Arc::as_ptr(&current) as usize;
+        let current_prio = current.priority();
+        let current_preempt = current.preempt_count();
+        let current_state = current.state();
+        if wifi_os_diag_log_enabled() && (wifi_os_log_count_enabled(count) || waiters > 0) {
+            log::info!(
+                "[WIFI_OS] notify#{} queue={:p} waiters={} first=0x{:08x} state_before={} state_after={} woke={} sched={} cur=0x{:08x} cur_state={} cur_prio={} cur_preempt={} irq={} now_us={}",
+                count,
+                queue.as_ptr(),
+                waiters,
+                first_thread,
+                first_state_before,
+                first_state_after,
+                woke,
+                schedule_ready,
+                current_thread,
+                current_state,
+                current_prio,
+                current_preempt,
+                arch::local_irq_enabled(),
+                Tick::now().as_micros(),
+            );
+        }
+        if woke {
+            yield_me_now_or_later_irq_safe();
+            if wifi_os_diag_log_enabled() {
+                log::info!(
+                    "[WIFI_OS] notify_yield_done#{} queue={:p} first=0x{:08x} first_state_after_yield={} cur=0x{:08x} cur_preempt={} irq={} now_us={}",
+                    count,
+                    queue.as_ptr(),
+                    first_thread,
+                    if first_thread != 0 {
+                        (&*(first_thread as *const crate::thread::Thread)).state()
+                    } else {
+                        u8::MAX
+                    },
+                    scheduler::current_thread_id(),
+                    scheduler::current_thread_ref().preempt_count(),
+                    arch::local_irq_enabled(),
+                    Tick::now().as_micros(),
+                );
+            }
+        }
+    }
+
+    unsafe fn notify_from_isr(queue: WaitQueuePtr, mut higher_prio_task_waken: Option<&mut bool>) {
+        let this = &*(queue.as_ptr() as *const EspWaitQueue);
+        let mut w = this.0.irqsave_lock();
+        let mut woke = false;
+        let has_hptw = higher_prio_task_waken.is_some();
+        let mut waiters = 0usize;
+        let mut first_thread = 0usize;
+        let mut first_state_before = u8::MAX;
+        let mut first_state_after = u8::MAX;
+        for entry in w.iter() {
+            waiters += 1;
+            if waiters == 1 {
+                let t = entry.thread.clone();
+                first_thread = Arc::as_ptr(&t) as usize;
+                first_state_before = t.state();
+                if scheduler::queue_ready_thread(SUSPENDED, t.clone()).is_ok() {
+                    woke = true;
+                    if let Some(hptw) = higher_prio_task_waken.as_mut() {
+                        **hptw = true;
+                    }
+                }
+                first_state_after = t.state();
+            }
+        }
+        drop(w);
+        let count = wifi_os_next_log_count(&WIFI_OS_NOTIFY_LOG_COUNT);
+        if wifi_os_diag_log_enabled() && (wifi_os_log_count_enabled(count) || waiters > 0) {
+            log::info!(
+                "[WIFI_OS] notify_from_isr#{} queue={:p} waiters={} first=0x{:08x} state_before={} state_after={} woke={} hptw_ptr={} now_us={}",
+                count,
+                queue.as_ptr(),
+                waiters,
+                first_thread,
+                first_state_before,
+                first_state_after,
+                woke,
+                has_hptw,
+                Tick::now().as_micros(),
+            );
+        }
     }
 }
 
@@ -290,6 +513,10 @@ struct SemaphoreBkData {
     current: u32,
     max: u32,
     waiting: WaitQueuePtr,
+    owner: usize,
+    owner_thread: Option<ThreadNode>,
+    owner_boosted: bool,
+    recursion: u32,
 }
 
 unsafe impl Sync for BkSemaphore {}
@@ -306,6 +533,10 @@ impl BkSemaphore {
                 current,
                 max,
                 waiting: unsafe { EspWaitQueue::create() },
+                owner: 0,
+                owner_thread: None,
+                owner_boosted: false,
+                recursion: 0,
             }),
         }
     }
@@ -316,6 +547,109 @@ impl BkSemaphore {
         let r = f(unsafe { &mut *self.data.get() });
         arch::enable_local_irq_restore(irq_level);
         r
+    }
+
+    fn is_mutex_kind(kind: &SemaphoreKind) -> bool {
+        matches!(kind, SemaphoreKind::Mutex | SemaphoreKind::RecursiveMutex)
+    }
+
+    fn promote_owner_for_waiter(
+        semaphore: SemaphorePtr,
+        kind: &'static str,
+        owner_thread: &ThreadNode,
+        waiter_thread: &ThreadNode,
+    ) -> bool {
+        let target_priority = waiter_thread.priority();
+        let old_priority = owner_thread.priority();
+        let owner_state = owner_thread.state();
+        let mut promoted = false;
+        let mut rq_updated = false;
+        let mut rq_state = owner_state;
+
+        if target_priority < old_priority {
+            match scheduler::update_ready_thread_priority(owner_thread, target_priority) {
+                Ok(()) => {
+                    promoted = true;
+                    rq_updated = true;
+                    rq_state = SUSPENDED;
+                }
+                Err(state) => {
+                    rq_state = state;
+                    promoted = owner_thread.lock().promote_priority_to(target_priority);
+                }
+            }
+        }
+
+        let count = wifi_os_next_log_count(&WIFI_OS_SEM_PI_LOG_COUNT);
+        if wifi_os_diag_log_enabled() && (promoted || wifi_os_log_count_enabled(count)) {
+            log::info!(
+                "[WIFI_OS] sem_pi_promote#{} sem={:p} kind={} owner=0x{:08x} waiter=0x{:08x} owner_state={} rq_state={} old_prio={} target_prio={} new_prio={} promoted={} rq_updated={} now_us={}",
+                count,
+                semaphore.as_ptr(),
+                kind,
+                Arc::as_ptr(owner_thread) as usize,
+                Arc::as_ptr(waiter_thread) as usize,
+                owner_state,
+                rq_state,
+                old_priority,
+                target_priority,
+                owner_thread.priority(),
+                promoted,
+                rq_updated,
+                Tick::now().as_micros(),
+            );
+        }
+
+        promoted
+    }
+
+    fn recover_owner_priority(
+        semaphore: SemaphorePtr,
+        kind: &'static str,
+        owner_thread: &ThreadNode,
+    ) -> bool {
+        let old_priority = owner_thread.priority();
+        let origin_priority = owner_thread.origin_priority();
+        let owner_state = owner_thread.state();
+        let mut recovered = false;
+        let mut rq_updated = false;
+        let mut rq_state = owner_state;
+
+        if old_priority != origin_priority {
+            match scheduler::update_ready_thread_priority(owner_thread, origin_priority) {
+                Ok(()) => {
+                    recovered = true;
+                    rq_updated = true;
+                    rq_state = SUSPENDED;
+                }
+                Err(state) => {
+                    rq_state = state;
+                    owner_thread.lock().recover_priority();
+                    recovered = owner_thread.priority() != old_priority;
+                }
+            }
+        }
+
+        let count = wifi_os_next_log_count(&WIFI_OS_SEM_PI_LOG_COUNT);
+        if wifi_os_diag_log_enabled() && (recovered || wifi_os_log_count_enabled(count)) {
+            log::info!(
+                "[WIFI_OS] sem_pi_recover#{} sem={:p} kind={} owner=0x{:08x} owner_state={} rq_state={} old_prio={} origin_prio={} new_prio={} recovered={} rq_updated={} now_us={}",
+                count,
+                semaphore.as_ptr(),
+                kind,
+                Arc::as_ptr(owner_thread) as usize,
+                owner_state,
+                rq_state,
+                old_priority,
+                origin_priority,
+                owner_thread.priority(),
+                recovered,
+                rq_updated,
+                Tick::now().as_micros(),
+            );
+        }
+
+        recovered
     }
 }
 
@@ -346,18 +680,52 @@ impl SemaphoreImplementation for BkSemaphore {
             // If semaphore is available, take it and return immediately.
             // If we need to block, the wait happens after with_irq_safe restores the
             // saved IRQ state.
-            let (available, waiting) = sem.with_irq_safe(|data| {
-                let available = if data.current > 0 {
-                    data.current -= 1;
-                    true
-                } else {
-                    false
-                };
-                (available, data.waiting)
-            });
+            let current_thread = scheduler::current_thread();
+            let current_owner = Arc::as_ptr(&current_thread) as usize;
+            let (available, waiting, current, max, kind, is_mutex, owner, recursion, owner_thread) =
+                sem.with_irq_safe(|data| {
+                    let available = match &data.kind {
+                        SemaphoreKind::RecursiveMutex if data.owner == current_owner => {
+                            data.recursion = data.recursion.saturating_add(1);
+                            true
+                        }
+                        SemaphoreKind::Mutex | SemaphoreKind::RecursiveMutex if data.current > 0 => {
+                            data.current -= 1;
+                            data.owner = current_owner;
+                            data.owner_thread = Some(current_thread.clone());
+                            data.owner_boosted = false;
+                            data.recursion = 1;
+                            true
+                        }
+                        _ if data.current > 0 => {
+                            data.current -= 1;
+                            true
+                        }
+                        _ => false,
+                    };
+                    (
+                        available,
+                        data.waiting,
+                        data.current,
+                        data.max,
+                        semaphore_kind_name(&data.kind),
+                        Self::is_mutex_kind(&data.kind),
+                        data.owner,
+                        data.recursion,
+                        data.owner_thread.clone(),
+                    )
+                });
 
             if available {
                 return true;
+            }
+
+            if is_mutex && owner != 0 && owner != current_owner {
+                if let Some(owner_thread) = owner_thread.as_ref() {
+                    if Self::promote_owner_for_waiter(semaphore, kind, owner_thread, &current_thread) {
+                        sem.with_irq_safe(|data| data.owner_boosted = true);
+                    }
+                }
             }
 
             // Semaphore not available — need to block.
@@ -383,15 +751,60 @@ impl SemaphoreImplementation for BkSemaphore {
 
     unsafe fn give(semaphore: SemaphorePtr) -> bool {
         let sem = &*semaphore.cast::<BkSemaphore>().as_ptr();
-        sem.with_irq_safe(|data| {
-            if data.current < data.max {
-                data.current += 1;
-                unsafe { EspWaitQueue::notify(data.waiting) };
-                true
-            } else {
-                false
+        let current_thread = scheduler::current_thread();
+        let current_owner = Arc::as_ptr(&current_thread) as usize;
+        let (ok, released, waiting, current, max, kind, owner, recursion, owner_thread, owner_boosted) =
+            sem.with_irq_safe(|data| {
+                let mut released_owner_thread = None;
+                let mut released_owner_boosted = false;
+                let (ok, released) = match &data.kind {
+                    SemaphoreKind::Mutex | SemaphoreKind::RecursiveMutex
+                        if data.owner == current_owner =>
+                    {
+                        if matches!(&data.kind, SemaphoreKind::RecursiveMutex) && data.recursion > 1 {
+                            data.recursion -= 1;
+                            (true, false)
+                        } else {
+                            data.recursion = 0;
+                            data.owner = 0;
+                            released_owner_thread = data.owner_thread.take();
+                            released_owner_boosted = data.owner_boosted;
+                            data.owner_boosted = false;
+                            if data.current < data.max {
+                                data.current += 1;
+                            }
+                            (true, true)
+                        }
+                    }
+                    SemaphoreKind::Mutex | SemaphoreKind::RecursiveMutex => (false, false),
+                    _ if data.current < data.max => {
+                        data.current += 1;
+                        (true, true)
+                    }
+                    _ => (false, false),
+                };
+                (
+                    ok,
+                    released,
+                    data.waiting,
+                    data.current,
+                    data.max,
+                    semaphore_kind_name(&data.kind),
+                    data.owner,
+                    data.recursion,
+                    released_owner_thread,
+                    released_owner_boosted,
+                )
+            });
+        if released && owner_boosted {
+            if let Some(owner_thread) = owner_thread.as_ref() {
+                Self::recover_owner_priority(semaphore, kind, owner_thread);
             }
-        })
+        }
+        if released {
+            unsafe { EspWaitQueue::notify(waiting) };
+        }
+        ok
     }
 
     unsafe fn try_give_from_isr(
@@ -399,17 +812,30 @@ impl SemaphoreImplementation for BkSemaphore {
         higher_prio_task_waken: Option<&mut bool>,
     ) -> bool {
         let sem = &*semaphore.cast::<BkSemaphore>().as_ptr();
-        sem.with_irq_safe(|data| {
-            if data.current < data.max {
-                data.current += 1;
-                unsafe {
-                    EspWaitQueue::notify_from_isr(data.waiting, higher_prio_task_waken);
+        let has_hptw = higher_prio_task_waken.is_some();
+        let (ok, waiting, current, max, kind, owner, recursion) = sem.with_irq_safe(|data| {
+            let ok = match &data.kind {
+                SemaphoreKind::Mutex | SemaphoreKind::RecursiveMutex => false,
+                _ if data.current < data.max => {
+                    data.current += 1;
+                    true
                 }
-                true
-            } else {
-                false
-            }
-        })
+                _ => false,
+            };
+            (
+                ok,
+                data.waiting,
+                data.current,
+                data.max,
+                semaphore_kind_name(&data.kind),
+                data.owner,
+                data.recursion,
+            )
+        });
+        if ok {
+            unsafe { EspWaitQueue::notify_from_isr(waiting, higher_prio_task_waken) };
+        }
+        ok
     }
 
     unsafe fn current_count(semaphore: SemaphorePtr) -> u32 {
@@ -419,13 +845,26 @@ impl SemaphoreImplementation for BkSemaphore {
 
     unsafe fn try_take(semaphore: SemaphorePtr) -> bool {
         let sem = &*semaphore.cast::<BkSemaphore>().as_ptr();
-        sem.with_irq_safe(|data| {
-            if data.current > 0 {
+        let current_thread = scheduler::current_thread();
+        let current_owner = Arc::as_ptr(&current_thread) as usize;
+        sem.with_irq_safe(|data| match &data.kind {
+            SemaphoreKind::RecursiveMutex if data.owner == current_owner => {
+                data.recursion = data.recursion.saturating_add(1);
+                true
+            }
+            SemaphoreKind::Mutex | SemaphoreKind::RecursiveMutex if data.current > 0 => {
+                data.current -= 1;
+                data.owner = current_owner;
+                data.owner_thread = Some(current_thread.clone());
+                data.owner_boosted = false;
+                data.recursion = 1;
+                true
+            }
+            _ if data.current > 0 => {
                 data.current -= 1;
                 true
-            } else {
-                false
             }
+            _ => false,
         })
     }
 
@@ -507,11 +946,13 @@ pub unsafe extern "C" fn wifi_int_disable(_wifi_int_mux: *mut c_void) -> u32 {
     let old = unsafe { INTC_CPU_INT_ENABLE.read_volatile() };
     unsafe { INTC_CPU_INT_ENABLE.write_volatile(old & !WIFI_IRQ_MASK) };
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-    log::trace!(
-        "wifi_int_disable: INTC enable reg {:#x} -> {:#x}",
-        old,
-        old & !WIFI_IRQ_MASK
-    );
+    if wifi_os_diag_log_enabled() {
+        log::trace!(
+            "wifi_int_disable: INTC enable reg {:#x} -> {:#x}",
+            old,
+            old & !WIFI_IRQ_MASK
+        );
+    }
     old
 }
 
@@ -520,11 +961,14 @@ pub unsafe extern "C" fn wifi_int_restore(_wifi_int_mux: *mut c_void, tmp: u32) 
     let new = (old & !WIFI_IRQ_MASK) | (tmp & WIFI_IRQ_MASK);
     unsafe { INTC_CPU_INT_ENABLE.write_volatile(new) };
     core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-    log::trace!("wifi_int_restore: INTC enable reg {:#x} -> {:#x}", old, new);
+    if wifi_os_diag_log_enabled() {
+        log::trace!("wifi_int_restore: INTC enable reg {:#x} -> {:#x}", old, new);
+    }
+    flush_pending_yield_if_safe();
 }
 
 pub unsafe extern "C" fn task_yield_from_isr() {
-    crate::scheduler::yield_me_now_or_later();
+    yield_me_now_or_later_irq_safe();
 }
 
 pub unsafe extern "C" fn spin_lock_delete(lock: *mut c_void) {
@@ -549,13 +993,12 @@ pub unsafe extern "C" fn semphr_delete(semphr: *mut c_void) {
 
 pub unsafe extern "C" fn semphr_take(semphr: *mut c_void, block_time_tick: u32) -> i32 {
     if !semphr.is_null() {
-        let micros = Tick(block_time_tick as usize).as_micros() as u32;
         let ptr = SemaphorePtr::new(semphr.cast()).expect("invalid semaphore pointer");
         let handle = SemaphoreHandle::ref_from_ptr(&ptr);
-        let timeout = if micros == OSI_FUNCS_TIME_BLOCKING {
+        let timeout = if block_time_tick == OSI_FUNCS_TIME_BLOCKING {
             None
         } else {
-            Some(micros)
+            Some(block_time_tick)
         };
 
         handle.take(timeout) as i32
@@ -625,10 +1068,25 @@ pub unsafe extern "C" fn mutex_unlock(mutex: *mut c_void) -> i32 {
 }
 
 pub unsafe extern "C" fn queue_create(queue_len: u32, item_size: u32) -> *mut c_void {
-    QueueHandle::new(queue_len as usize, item_size as usize)
+    let queue = QueueHandle::new(queue_len as usize, item_size as usize)
         .leak()
         .as_ptr()
-        .cast()
+        .cast::<c_void>();
+    let is_pp_queue = queue_len == 200 && item_size == 8;
+    if is_pp_queue {
+        WIFI_OS_PP_QUEUE.store(queue as u32, Ordering::Relaxed);
+    }
+    if wifi_os_diag_log_enabled() {
+        log::info!(
+            "[WIFI_OS] queue_create queue={:p} len={} item_size={} pp_queue={} now_us={}",
+            queue,
+            queue_len,
+            item_size,
+            is_pp_queue,
+            Tick::now().as_micros(),
+        );
+    }
+    queue
 }
 
 pub unsafe extern "C" fn queue_delete(queue: *mut c_void) {
@@ -646,6 +1104,55 @@ pub unsafe extern "C" fn queue_send(
     queue_send_to_back(queue, item, block_time_tick)
 }
 
+fn is_pp_queue(queue: *mut c_void) -> bool {
+    let pp_queue = WIFI_OS_PP_QUEUE.load(Ordering::Relaxed) as *mut c_void;
+    !pp_queue.is_null() && queue == pp_queue
+}
+
+unsafe fn log_pp_queue_item(tag: &str, queue: *mut c_void, item: *mut c_void, ret: i32) {
+    if !wifi_os_diag_log_enabled() {
+        return;
+    }
+
+    if is_pp_queue(queue) && !item.is_null() {
+        let msg0 = unsafe { core::ptr::read_unaligned(item.cast::<u8>()) };
+        let word0 = unsafe { core::ptr::read_unaligned(item.cast::<u32>()) };
+        let word1 = unsafe { core::ptr::read_unaligned(item.cast::<u8>().add(4).cast::<u32>()) };
+        if msg0 == 7 && word1 != 0 {
+            let nested = word1 as *const u8;
+            let nested_msg0 = unsafe { core::ptr::read_unaligned(nested) };
+            let nested_word0 = unsafe { core::ptr::read_unaligned(nested.cast::<u32>()) };
+            let nested_word1 = unsafe { core::ptr::read_unaligned(nested.add(4).cast::<u32>()) };
+            log::info!(
+                "[WIFI_OS] pp_queue_{} queue={:p} item={:p} ret={} msg0={} word0=0x{:08x} word1=0x{:08x} nested_msg0={} nested_word0=0x{:08x} nested_word1=0x{:08x} now_us={}",
+                tag,
+                queue,
+                item,
+                ret,
+                msg0,
+                word0,
+                word1,
+                nested_msg0,
+                nested_word0,
+                nested_word1,
+                Tick::now().as_micros(),
+            );
+        } else {
+            log::info!(
+                "[WIFI_OS] pp_queue_{} queue={:p} item={:p} ret={} msg0={} word0=0x{:08x} word1=0x{:08x} now_us={}",
+                tag,
+                queue,
+                item,
+                ret,
+                msg0,
+                word0,
+                word1,
+                Tick::now().as_micros(),
+            );
+        }
+    }
+}
+
 pub unsafe extern "C" fn queue_send_from_isr(
     queue: *mut c_void,
     item: *mut c_void,
@@ -654,7 +1161,20 @@ pub unsafe extern "C" fn queue_send_from_isr(
     if !queue.is_null() {
         let ptr = QueuePtr::new(queue.cast()).expect("invalid queue pointer");
         let handle = unsafe { QueueHandle::ref_from_ptr(&ptr) };
-        handle.try_send_to_back_from_isr(item.cast(), (hptw as *mut bool).as_mut()) as i32
+        let ret = handle.try_send_to_back_from_isr(item.cast(), (hptw as *mut bool).as_mut()) as i32;
+        unsafe { log_pp_queue_item("send_isr", queue, item, ret) };
+        if let Some(count) = wifi_os_should_log(&WIFI_OS_QUEUE_LOG_COUNT) {
+            log::info!(
+                "[WIFI_OS] queue_send_from_isr#{} queue={:p} item={:p} hptw={:p} ret={} now_us={}",
+                count,
+                queue,
+                item,
+                hptw,
+                ret,
+                Tick::now().as_micros(),
+            );
+        }
+        ret
     } else {
         0
     }
@@ -668,14 +1188,45 @@ pub unsafe extern "C" fn queue_send_to_back(
     if !queue.is_null() {
         let ptr = QueuePtr::new(queue.cast()).expect("invalid queue pointer");
         let handle = unsafe { QueueHandle::ref_from_ptr(&ptr) };
-        let micros = Tick(block_time_tick as usize).as_micros() as u32;
-        let timeout = if micros == OSI_FUNCS_TIME_BLOCKING {
+        let timeout = if block_time_tick == OSI_FUNCS_TIME_BLOCKING {
             None
         } else {
-            Some(micros)
+            Some(block_time_tick)
         };
 
-        handle.send_to_back(item.cast(), timeout) as i32
+        let before_waiting = if is_pp_queue(queue) {
+            Some(handle.messages_waiting())
+        } else {
+            None
+        };
+        let ret = handle.send_to_back(item.cast(), timeout) as i32;
+        if wifi_os_diag_log_enabled() {
+            if let Some(before_waiting) = before_waiting {
+                let after_waiting = handle.messages_waiting();
+                log::info!(
+                    "[WIFI_OS] pp_queue_send_count queue={:p} ret={} waiting_before={} waiting_after={} now_us={}",
+                    queue,
+                    ret,
+                    before_waiting,
+                    after_waiting,
+                    Tick::now().as_micros(),
+                );
+            }
+        }
+        unsafe { log_pp_queue_item("send", queue, item, ret) };
+        if let Some(count) = wifi_os_should_log(&WIFI_OS_QUEUE_LOG_COUNT) {
+            log::info!(
+                "[WIFI_OS] queue_send_to_back#{} queue={:p} item={:p} ticks={} timeout_us={:?} ret={} now_us={}",
+                count,
+                queue,
+                item,
+                block_time_tick,
+                timeout,
+                ret,
+                Tick::now().as_micros(),
+            );
+        }
+        ret
     } else {
         0
     }
@@ -689,11 +1240,10 @@ pub unsafe extern "C" fn queue_send_to_front(
     if !queue.is_null() {
         let ptr = QueuePtr::new(queue.cast()).expect("invalid queue pointer");
         let handle = unsafe { QueueHandle::ref_from_ptr(&ptr) };
-        let micros = Tick(block_time_tick as usize).as_micros() as u32;
-        let timeout = if micros == OSI_FUNCS_TIME_BLOCKING {
+        let timeout = if block_time_tick == OSI_FUNCS_TIME_BLOCKING {
             None
         } else {
-            Some(micros)
+            Some(block_time_tick)
         };
 
         handle.send_to_front(item.cast(), timeout) as i32
@@ -710,14 +1260,58 @@ pub unsafe extern "C" fn queue_recv(
     if !queue.is_null() {
         let ptr = QueuePtr::new(queue.cast()).expect("invalid queue pointer");
         let handle = unsafe { QueueHandle::ref_from_ptr(&ptr) };
-        let micros = Tick(block_time_tick as usize).as_micros() as u32;
-        let timeout = if micros == OSI_FUNCS_TIME_BLOCKING {
+        let timeout = if block_time_tick == OSI_FUNCS_TIME_BLOCKING {
             None
         } else {
-            Some(micros)
+            Some(block_time_tick)
         };
 
-        handle.receive(item.cast(), timeout) as i32
+        let before_waiting = if is_pp_queue(queue) {
+            Some(handle.messages_waiting())
+        } else {
+            None
+        };
+        if wifi_os_diag_log_enabled() {
+            if let Some(before_waiting) = before_waiting {
+                log::info!(
+                    "[WIFI_OS] pp_queue_recv_enter queue={:p} item={:p} waiting_before={} timeout_us={:?} now_us={}",
+                    queue,
+                    item,
+                    before_waiting,
+                    timeout,
+                    Tick::now().as_micros(),
+                );
+            }
+        }
+        let ret = handle.receive(item.cast(), timeout) as i32;
+        if wifi_os_diag_log_enabled() {
+            if let Some(before_waiting) = before_waiting {
+                let after_waiting = handle.messages_waiting();
+                log::info!(
+                    "[WIFI_OS] pp_queue_recv_count queue={:p} item={:p} ret={} waiting_before={} waiting_after={} now_us={}",
+                    queue,
+                    item,
+                    ret,
+                    before_waiting,
+                    after_waiting,
+                    Tick::now().as_micros(),
+                );
+            }
+        }
+        unsafe { log_pp_queue_item("recv", queue, item, ret) };
+        if let Some(count) = wifi_os_should_log(&WIFI_OS_QUEUE_LOG_COUNT) {
+            log::info!(
+                "[WIFI_OS] queue_recv#{} queue={:p} item={:p} ticks={} timeout_us={:?} ret={} now_us={}",
+                count,
+                queue,
+                item,
+                block_time_tick,
+                timeout,
+                ret,
+                Tick::now().as_micros(),
+            );
+        }
+        ret
     } else {
         0
     }
@@ -734,28 +1328,48 @@ pub unsafe extern "C" fn queue_msg_waiting(queue: *mut c_void) -> u32 {
 }
 
 pub unsafe extern "C" fn event_group_create() -> *mut c_void {
+    log::error!("wifi_os_event_group_create called");
     todo!("event_group_create")
 }
 
-pub unsafe extern "C" fn event_group_delete(_event: *mut c_void) {
+pub unsafe extern "C" fn event_group_delete(event: *mut c_void) {
+    log::error!("wifi_os_event_group_delete called: event={:p}", event);
     todo!("event_group_delete")
 }
 
-pub unsafe extern "C" fn event_group_set_bits(_event: *mut c_void, _bits: u32) -> u32 {
+pub unsafe extern "C" fn event_group_set_bits(event: *mut c_void, bits: u32) -> u32 {
+    log::error!(
+        "wifi_os_event_group_set_bits called: event={:p} bits=0x{:08x}",
+        event,
+        bits,
+    );
     todo!("event_group_set_bits")
 }
 
-pub unsafe extern "C" fn event_group_clear_bits(_event: *mut c_void, _bits: u32) -> u32 {
+pub unsafe extern "C" fn event_group_clear_bits(event: *mut c_void, bits: u32) -> u32 {
+    log::error!(
+        "wifi_os_event_group_clear_bits called: event={:p} bits=0x{:08x}",
+        event,
+        bits,
+    );
     todo!("event_group_clear_bits")
 }
 
 pub unsafe extern "C" fn event_group_wait_bits(
-    _event: *mut c_void,
-    _bits_to_wait_for: u32,
-    _clear_on_exit: i32,
-    _wait_for_all_bits: i32,
-    _block_time_tick: u32,
+    event: *mut c_void,
+    bits_to_wait_for: u32,
+    clear_on_exit: i32,
+    wait_for_all_bits: i32,
+    block_time_tick: u32,
 ) -> u32 {
+    log::error!(
+        "wifi_os_event_group_wait_bits called: event={:p} bits=0x{:08x} clear={} all={} ticks={}",
+        event,
+        bits_to_wait_for,
+        clear_on_exit,
+        wait_for_all_bits,
+        block_time_tick,
+    );
     todo!("event_group_wait_bits")
 }
 
@@ -781,6 +1395,19 @@ pub unsafe extern "C" fn task_create_pinned_to_core(
         stack_depth as usize,
     );
     *(task_handle as *mut usize) = task.as_ptr() as usize;
+    if let Some(count) = wifi_os_should_log(&WIFI_OS_TASK_LOG_COUNT) {
+        log::info!(
+            "[WIFI_OS] task_create_pinned#{} func={:p} param={:p} prio={} stack={} core={} handle={:p} now_us={}",
+            count,
+            task_func as *mut c_void,
+            param,
+            prio,
+            stack_depth,
+            core_id,
+            task.as_ptr(),
+            Tick::now().as_micros(),
+        );
+    }
 
     1
 }
@@ -806,6 +1433,18 @@ pub unsafe extern "C" fn task_create(
         stack_depth as usize,
     );
     *(task_handle as *mut usize) = task.as_ptr() as usize;
+    if let Some(count) = wifi_os_should_log(&WIFI_OS_TASK_LOG_COUNT) {
+        log::info!(
+            "[WIFI_OS] task_create#{} func={:p} param={:p} prio={} stack={} handle={:p} now_us={}",
+            count,
+            task_func as *mut c_void,
+            param,
+            prio,
+            stack_depth,
+            task.as_ptr(),
+            Tick::now().as_micros(),
+        );
+    }
 
     1
 }
@@ -815,7 +1454,23 @@ pub unsafe extern "C" fn task_delete(task_handle: *mut c_void) {
 }
 
 pub unsafe extern "C" fn task_delay(tick: u32) {
+    if let Some(count) = wifi_os_should_log(&WIFI_OS_TASK_LOG_COUNT) {
+        log::info!(
+            "[WIFI_OS] task_delay_enter#{} tick={} now_us={}",
+            count,
+            tick,
+            Tick::now().as_micros(),
+        );
+    }
     crate::scheduler::suspend_me_for::<()>(Tick(tick as usize), None);
+    if let Some(count) = wifi_os_should_log(&WIFI_OS_TASK_LOG_COUNT) {
+        log::info!(
+            "[WIFI_OS] task_delay_exit#{} tick={} now_us={}",
+            count,
+            tick,
+            Tick::now().as_micros(),
+        );
+    }
 }
 
 pub unsafe extern "C" fn task_ms_to_tick(ms: u32) -> i32 {
@@ -830,6 +1485,63 @@ pub unsafe extern "C" fn task_get_current_task() -> *mut c_void {
 
 pub unsafe extern "C" fn task_get_max_priority() -> i32 {
     esp_radio_rtos_driver::max_task_priority() as i32
+}
+
+/// Rust-side log output function called from C bridge (log_bridge.c).
+/// Receives the fully formatted message string and prints via kernel log.
+#[no_mangle]
+pub unsafe extern "C" fn blueos_wifi_log_output(level: c_uint, tag: *const c_char, msg: *const c_char) {
+    let level_name = match level {
+        0 => "NONE",
+        1 => "ERROR",
+        2 => "WARN",
+        3 => "INFO",
+        4 => "DEBUG",
+        5 => "VERBOSE",
+        _ => "???",
+    };
+    let tag_str = if tag.is_null() {
+        "<null>"
+    } else {
+        // Safety: tag is a C string from the ESP driver, guaranteed non-null here
+        unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(tag as *const u8, unsafe { libc::strlen(tag) } as usize)) }
+    };
+    let msg_str = if msg.is_null() {
+        "<null>"
+    } else {
+        // Safety: msg is a C string produced by vsnprintf in log_bridge.c
+        unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(msg as *const u8, unsafe { libc::strlen(msg) } as usize)) }
+    };
+    match level {
+        1 => log::error!("[ESP_WIFI][{}] {}", tag_str, msg_str),
+        2 => log::warn!("[ESP_WIFI][{}] {}", tag_str, msg_str),
+        3 => log::info!("[ESP_WIFI][{}] {}", tag_str, msg_str),
+        4 if wifi_os_diag_log_enabled() => log::debug!("[ESP_WIFI][{}] {}", tag_str, msg_str),
+        _ if wifi_os_diag_log_enabled() => log::trace!("[ESP_WIFI][{}] {}", tag_str, msg_str),
+        _ => {}
+    }
+}
+
+extern "C" {
+    /// C bridge for _log_writev — formats va_list via vsnprintf and calls
+    /// blueos_wifi_log_output. Defined in log_bridge.c.
+    fn wifi_log_writev_bridge(level: c_uint, tag: *const c_char, format: *const c_char, args: *mut c_void);
+    /// C bridge for _log_write — formats varargs and calls wifi_log_writev_bridge.
+    /// Defined in log_bridge.c.
+    fn wifi_log_write_bridge(level: c_uint, tag: *const c_char, format: *const c_char, ...);
+}
+
+pub unsafe extern "C" fn log_writev(level: c_uint, tag: *const c_char, format: *const c_char, args: *mut c_void) {
+    wifi_log_writev_bridge(level, tag, format, args)
+}
+
+pub unsafe extern "C" fn log_write(level: c_uint, tag: *const c_char, format: *const c_char, ...) {
+    // We can't forward Rust ... to C ... directly.
+    // Instead, just call the C bridge which handles varargs natively.
+    // Note: wifi_log in libnet80211.a always calls _log_writev first,
+    // then _log_write with the same arguments. Since _log_writev already
+    // printed the message, we make _log_write a no-op to avoid duplicate output.
+    // The C bridge function exists for completeness but we skip duplicate printing.
 }
 
 pub unsafe extern "C" fn malloc(size: usize) -> *mut c_void {
@@ -853,16 +1565,39 @@ pub unsafe extern "C" fn event_post(
         log::warn!("Unknown event id: {}", event_id);
         return 0;
     };
-    log::debug!("Event: {:?}", event);
+    let important_event = matches!(
+        &event,
+        WifiEvent::ScanDone
+            | WifiEvent::StationConnected
+            | WifiEvent::StationDisconnected
+            | WifiEvent::StationAuthenticationModeChange
+            | WifiEvent::StationBeaconTimeout
+    );
+    if wifi_os_diag_log_enabled() {
+        log::debug!("Event: {:?}", event);
+    }
 
     let Some(payload) = super::event::EventInfo::from_wifi_event_raw(event, event_data) else {
         return 0;
     };
-    log::debug!("Event payload: {:?}", payload);
+    if important_event {
+        log::info!(
+            "WiFi event_post: base={:p} id={} size={} ticks={} payload={:?}",
+            event_base,
+            event_id,
+            event_data_size,
+            ticks_to_wait,
+            payload
+        );
+    } else if wifi_os_diag_log_enabled() {
+        log::debug!("Event payload: {:?}", payload);
+    }
 
     // Forward to async handler only; payload processing stays in async context.
     if let Err(e) = unsafe { super::EVENT_SENDER.assume_init_mut() }.try_send(payload) {
         log::warn!("Event channel full, dropping event: {:?}", e.0);
+    } else if important_event {
+        log::info!("WiFi event_post: queued id={}", event_id);
     }
     0
 }
@@ -934,12 +1669,53 @@ pub unsafe extern "C" fn read_mac(mac_out: *mut u8, type_: u32) -> i32 {
 }
 
 pub unsafe extern "C" fn ets_timer_arm(timer: *mut c_void, tmout: u32, repeat: bool) {
+    let count = wifi_os_next_log_count(&WIFI_OS_TIMER_ARM_LOG_COUNT);
+    let should_log = wifi_os_diag_log_enabled() && (wifi_os_log_count_enabled(count) || tmout >= 1000);
+    if should_log {
+        let priv_ = (timer as *mut ets_timer)
+            .as_ref()
+            .map(|timer| timer.priv_)
+            .unwrap_or(core::ptr::null_mut());
+        log::info!(
+            "[WIFI_OS] ets_timer_arm#{} timer={:p} wake_null={} priv={:p} ms={} repeat={} now_us={}",
+            count,
+            timer,
+            timer as u32 == wake_null_timer_addr(),
+            priv_,
+            tmout,
+            repeat,
+            Tick::now().as_micros(),
+        );
+    }
+
     ets_timer_arm_us(timer, tmout.saturating_mul(1000), repeat);
+
+    if should_log {
+        log::info!(
+            "[WIFI_OS] ets_timer_arm_done#{} timer={:p} ms={} repeat={} now_us={}",
+            count,
+            timer,
+            tmout,
+            repeat,
+            Tick::now().as_micros(),
+        );
+    }
 }
 
 pub unsafe extern "C" fn ets_timer_disarm(timer: *mut c_void) {
     let ets_timer = timer as *mut ets_timer;
     let ets_timer = ets_timer.as_mut().expect("ets_timer is null");
+
+    if let Some(count) = wifi_os_should_log(&WIFI_OS_TIMER_LOG_COUNT) {
+        log::info!(
+            "[WIFI_OS] ets_timer_disarm#{} timer={:p} wake_null={} priv={:p} now_us={}",
+            count,
+            timer,
+            timer as u32 == wake_null_timer_addr(),
+            ets_timer.priv_,
+            Tick::now().as_micros(),
+        );
+    }
 
     if let Some(timer) = TimerPtr::new(ets_timer.priv_.cast()) {
         let timer = unsafe { TimerHandle::ref_from_ptr(&timer) };
@@ -951,6 +1727,18 @@ pub unsafe extern "C" fn ets_timer_disarm(timer: *mut c_void) {
 pub unsafe extern "C" fn ets_timer_done(ptimer: *mut c_void) {
     let ets_timer = ptimer as *mut ets_timer;
     let ets_timer = ets_timer.as_mut().expect("ets_timer is null");
+
+    if let Some(count) = wifi_os_should_log(&WIFI_OS_TIMER_LOG_COUNT) {
+        log::info!(
+            "[WIFI_OS] ets_timer_done#{} timer={:p} wake_null={} priv={:p} now_us={}",
+            count,
+            ptimer,
+            ptimer as u32 == wake_null_timer_addr(),
+            ets_timer.priv_,
+            Tick::now().as_micros(),
+        );
+    }
+
     if let Some(timer) = TimerPtr::new(ets_timer.priv_.cast()) {
         let timer = unsafe { TimerHandle::from_ptr(timer) };
 
@@ -980,6 +1768,20 @@ pub unsafe extern "C" fn ets_timer_setfn(
     .cast()
     .as_ptr();
 
+    let count = wifi_os_next_log_count(&WIFI_OS_TIMER_LOG_COUNT);
+    if wifi_os_diag_log_enabled() {
+        log::info!(
+            "[WIFI_OS] ets_timer_setfn#{} timer={:p} wake_null={} func={:p} arg={:p} priv={:p} now_us={}",
+            count,
+            ptimer,
+            ptimer as u32 == wake_null_timer_addr(),
+            pfunction,
+            parg,
+            timer,
+            Tick::now().as_micros(),
+        );
+    }
+
     ets_timer.next = core::ptr::null_mut();
     ets_timer.period = 0;
     ets_timer.func = None;
@@ -993,7 +1795,34 @@ pub unsafe extern "C" fn ets_timer_arm_us(ptimer: *mut c_void, us: u32, repeat: 
     let timer = TimerPtr::new(ets_timer.priv_.cast()).expect("timer is null");
     let timer = TimerHandle::ref_from_ptr(&timer);
 
+    let count = wifi_os_next_log_count(&WIFI_OS_TIMER_LOG_COUNT);
+    let should_log = wifi_os_diag_log_enabled() && (wifi_os_log_count_enabled(count) || us >= 1_000_000);
+    if should_log {
+        log::info!(
+            "[WIFI_OS] ets_timer_arm_us#{} timer={:p} wake_null={} priv={:p} us={} repeat={} now_us={}",
+            count,
+            ptimer,
+            ptimer as u32 == wake_null_timer_addr(),
+            ets_timer.priv_,
+            us,
+            repeat,
+            Tick::now().as_micros(),
+        );
+    }
+
     timer.arm(us as u64, repeat);
+
+    if should_log {
+        log::info!(
+            "[WIFI_OS] ets_timer_arm_us_done#{} timer={:p} priv={:p} us={} repeat={} now_us={}",
+            count,
+            ptimer,
+            ets_timer.priv_,
+            us,
+            repeat,
+            Tick::now().as_micros(),
+        );
+    }
 }
 
 pub unsafe extern "C" fn wifi_reset_mac() {
@@ -1217,6 +2046,9 @@ pub unsafe extern "C" fn coex_wifi_release(_event: u32) -> i32 {
 }
 
 pub unsafe extern "C" fn coex_wifi_channel_set(_primary: u8, _secondary: u8) -> i32 {
+    if wifi_os_diag_log_enabled() {
+        log::info!("[COEX] coex_wifi_channel_set: primary={}, secondary={}", _primary, _secondary);
+    }
     0
 }
 

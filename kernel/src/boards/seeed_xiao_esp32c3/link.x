@@ -303,11 +303,19 @@ SECTIONS {
 }
 
 EXTERN( __ESP_RADIO_G_WIFI_OSI_FUNCS );
+EXTERN( __ESP_RADIO_G_WIFI_FEATURE_CAPS );
 
 PROVIDE(__global_pointer$ = ALIGN(_sdata_start, 4) + 0x800);
 PROVIDE( g_wifi_osi_funcs = __ESP_RADIO_G_WIFI_OSI_FUNCS );
+PROVIDE( g_wifi_feature_caps = __ESP_RADIO_G_WIFI_FEATURE_CAPS );
 
 EXTERN( __ESP_RADIO_WIFI_EVENT );
 PROVIDE( WIFI_EVENT = __ESP_RADIO_WIFI_EVENT );
+
+EXTERN( __ESP_RADIO_G_MISC_NVS );
+EXTERN( __ESP_RADIO_G_LOG_LEVEL );
+PROVIDE( g_misc_nvs = __ESP_RADIO_G_MISC_NVS );
+PROVIDE( g_log_level = __ESP_RADIO_G_LOG_LEVEL );
+
 EXTERN( g_espnow_user_oui );
 EXTERN( mesh_sta_auth_expire_time );

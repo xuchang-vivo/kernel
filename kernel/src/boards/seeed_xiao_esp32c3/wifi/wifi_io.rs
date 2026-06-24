@@ -13,16 +13,44 @@
 // limitations under the License.
 
 use super::hal::ram;
-use esp_wifi_sys_esp32c3::{c_types, include::esp_err_t};
+use core::sync::atomic::{AtomicU32, Ordering};
+use esp_wifi_sys_esp32c3::{
+    c_types,
+    include::{esp_err_t, esp_wifi_internal_free_rx_buffer},
+};
 use smoltcp::phy::{RxToken, TxToken};
+
+static STA_RX_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
+static AP_RX_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
 
 #[ram]
 pub(crate) unsafe extern "C" fn esp_wifi_tx_done_cb(
-    _ifidx: u8,
-    _data: *mut u8,
-    _data_len: *mut u16,
-    _tx_status: bool,
+    ifidx: u8,
+    data: *mut u8,
+    data_len: *mut u16,
+    tx_status: bool,
 ) {
+    let len = if data_len.is_null() {
+        0
+    } else {
+        core::ptr::read_volatile(data_len)
+    };
+    let ethertype = if !data.is_null() && len >= 14 {
+        let data = core::slice::from_raw_parts(data as *const u8, len as usize);
+        u16::from_be_bytes([data[12], data[13]])
+    } else {
+        0
+    };
+
+    if ethertype == 0x888e {
+        log::info!(
+            "wifi_tx_done: ifidx={} len={} status={} ethertype=0x{:04x}",
+            ifidx,
+            len,
+            tx_status,
+            ethertype,
+        );
+    }
 }
 
 pub(crate) unsafe extern "C" fn recv_cb_ap(
@@ -30,6 +58,11 @@ pub(crate) unsafe extern "C" fn recv_cb_ap(
     len: u16,
     eb: *mut c_types::c_void,
 ) -> esp_err_t {
+    let count = AP_RX_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if count < 8 {
+        log_rx_packet("ap", count, buffer, len, eb);
+    }
+    esp_wifi_internal_free_rx_buffer(eb);
     0
 }
 
@@ -38,7 +71,38 @@ pub(crate) unsafe extern "C" fn recv_cb_sta(
     len: u16,
     eb: *mut c_types::c_void,
 ) -> esp_err_t {
+    let count = STA_RX_LOG_COUNT.fetch_add(1, Ordering::Relaxed);
+    if count < 32 {
+        log_rx_packet("sta", count, buffer, len, eb);
+    }
+    esp_wifi_internal_free_rx_buffer(eb);
     0
+}
+
+unsafe fn log_rx_packet(
+    iface: &str,
+    count: u32,
+    buffer: *mut c_types::c_void,
+    len: u16,
+    eb: *mut c_types::c_void,
+) {
+    let data = core::slice::from_raw_parts(buffer as *const u8, len as usize);
+    let ethertype = if data.len() >= 14 {
+        u16::from_be_bytes([data[12], data[13]])
+    } else {
+        0
+    };
+
+    if ethertype == 0x888e || count < 8 {
+        log::info!(
+            "wifi_rx[{}#{}]: len={} eb={:p} ethertype=0x{:04x}",
+            iface,
+            count,
+            len,
+            eb,
+            ethertype,
+        );
+    }
 }
 
 pub struct WifiTxToken {}
