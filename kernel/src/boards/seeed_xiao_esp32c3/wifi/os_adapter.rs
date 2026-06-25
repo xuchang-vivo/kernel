@@ -67,19 +67,13 @@ static WIFI_OS_QUEUE_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
 static WIFI_OS_TASK_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
 static WIFI_OS_TIMER_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
 static WIFI_OS_TIMER_ARM_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
-static WIFI_TIMER_BACKEND_LOG_COUNT: AtomicU32 = AtomicU32::new(0);
 static WIFI_OS_PP_QUEUE: AtomicU32 = AtomicU32::new(0);
 static WIFI_OS_PENDING_YIELD: AtomicBool = AtomicBool::new(false);
 
 const WIFI_OS_DIAG_LOG_ENABLED: bool = false;
-const WIFI_TIMER_DIAG_LOG_ENABLED: bool = false;
 
 fn wifi_os_diag_log_enabled() -> bool {
     WIFI_OS_DIAG_LOG_ENABLED
-}
-
-fn wifi_timer_diag_log_enabled() -> bool {
-    WIFI_TIMER_DIAG_LOG_ENABLED
 }
 
 fn wifi_os_should_log(counter: &AtomicU32) -> Option<u32> {
@@ -108,30 +102,6 @@ fn semaphore_kind_name(kind: &SemaphoreKind) -> &'static str {
         SemaphoreKind::Counting { .. } => "counting",
         SemaphoreKind::Mutex => "mutex",
         SemaphoreKind::RecursiveMutex => "recursive_mutex",
-    }
-}
-
-#[no_mangle]
-unsafe extern "Rust" fn blueos_wifi_timer_diag(event: u32, a: usize, b: u64, c: u64, d: u64) {
-    if !wifi_timer_diag_log_enabled() {
-        return;
-    }
-
-    let count = wifi_os_next_log_count(&WIFI_TIMER_BACKEND_LOG_COUNT);
-    let should_log = wifi_os_log_count_enabled(count)
-        || matches!(event, 10 | 11 | 12) && b >= 1_000_000
-        || matches!(event, 5 | 6 | 7);
-    if should_log {
-        log::info!(
-            "[WIFI_TIMER] diag#{} event={} a=0x{:08x} b={} c={} d={} now_us={}",
-            count,
-            event,
-            a,
-            b,
-            c,
-            d,
-            Tick::now().as_micros(),
-        );
     }
 }
 
