@@ -226,9 +226,7 @@ impl NetIface {
             | NetIfaceControl::WifiPassphrase(_)
             | NetIfaceControl::WifiConnect { .. }
             | NetIfaceControl::WifiDisconnect
-            | NetIfaceControl::WifiSignalStrength => {
-                Err(NetIfaceError::NotSupported)
-            }
+            | NetIfaceControl::WifiSignalStrength => Err(NetIfaceError::NotSupported),
             NetIfaceControl::EthernetSetPromiscuous(_) => {
                 Err(NetIfaceError::DeviceTraitNotAvailable)
             }

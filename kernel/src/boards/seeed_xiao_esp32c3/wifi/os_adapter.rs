@@ -689,7 +689,9 @@ impl SemaphoreImplementation for BkSemaphore {
                             data.recursion = data.recursion.saturating_add(1);
                             true
                         }
-                        SemaphoreKind::Mutex | SemaphoreKind::RecursiveMutex if data.current > 0 => {
+                        SemaphoreKind::Mutex | SemaphoreKind::RecursiveMutex
+                            if data.current > 0 =>
+                        {
                             data.current -= 1;
                             data.owner = current_owner;
                             data.owner_thread = Some(current_thread.clone());
@@ -722,7 +724,12 @@ impl SemaphoreImplementation for BkSemaphore {
 
             if is_mutex && owner != 0 && owner != current_owner {
                 if let Some(owner_thread) = owner_thread.as_ref() {
-                    if Self::promote_owner_for_waiter(semaphore, kind, owner_thread, &current_thread) {
+                    if Self::promote_owner_for_waiter(
+                        semaphore,
+                        kind,
+                        owner_thread,
+                        &current_thread,
+                    ) {
                         sem.with_irq_safe(|data| data.owner_boosted = true);
                     }
                 }
@@ -753,49 +760,59 @@ impl SemaphoreImplementation for BkSemaphore {
         let sem = &*semaphore.cast::<BkSemaphore>().as_ptr();
         let current_thread = scheduler::current_thread();
         let current_owner = Arc::as_ptr(&current_thread) as usize;
-        let (ok, released, waiting, current, max, kind, owner, recursion, owner_thread, owner_boosted) =
-            sem.with_irq_safe(|data| {
-                let mut released_owner_thread = None;
-                let mut released_owner_boosted = false;
-                let (ok, released) = match &data.kind {
-                    SemaphoreKind::Mutex | SemaphoreKind::RecursiveMutex
-                        if data.owner == current_owner =>
-                    {
-                        if matches!(&data.kind, SemaphoreKind::RecursiveMutex) && data.recursion > 1 {
-                            data.recursion -= 1;
-                            (true, false)
-                        } else {
-                            data.recursion = 0;
-                            data.owner = 0;
-                            released_owner_thread = data.owner_thread.take();
-                            released_owner_boosted = data.owner_boosted;
-                            data.owner_boosted = false;
-                            if data.current < data.max {
-                                data.current += 1;
-                            }
-                            (true, true)
+        let (
+            ok,
+            released,
+            waiting,
+            current,
+            max,
+            kind,
+            owner,
+            recursion,
+            owner_thread,
+            owner_boosted,
+        ) = sem.with_irq_safe(|data| {
+            let mut released_owner_thread = None;
+            let mut released_owner_boosted = false;
+            let (ok, released) = match &data.kind {
+                SemaphoreKind::Mutex | SemaphoreKind::RecursiveMutex
+                    if data.owner == current_owner =>
+                {
+                    if matches!(&data.kind, SemaphoreKind::RecursiveMutex) && data.recursion > 1 {
+                        data.recursion -= 1;
+                        (true, false)
+                    } else {
+                        data.recursion = 0;
+                        data.owner = 0;
+                        released_owner_thread = data.owner_thread.take();
+                        released_owner_boosted = data.owner_boosted;
+                        data.owner_boosted = false;
+                        if data.current < data.max {
+                            data.current += 1;
                         }
-                    }
-                    SemaphoreKind::Mutex | SemaphoreKind::RecursiveMutex => (false, false),
-                    _ if data.current < data.max => {
-                        data.current += 1;
                         (true, true)
                     }
-                    _ => (false, false),
-                };
-                (
-                    ok,
-                    released,
-                    data.waiting,
-                    data.current,
-                    data.max,
-                    semaphore_kind_name(&data.kind),
-                    data.owner,
-                    data.recursion,
-                    released_owner_thread,
-                    released_owner_boosted,
-                )
-            });
+                }
+                SemaphoreKind::Mutex | SemaphoreKind::RecursiveMutex => (false, false),
+                _ if data.current < data.max => {
+                    data.current += 1;
+                    (true, true)
+                }
+                _ => (false, false),
+            };
+            (
+                ok,
+                released,
+                data.waiting,
+                data.current,
+                data.max,
+                semaphore_kind_name(&data.kind),
+                data.owner,
+                data.recursion,
+                released_owner_thread,
+                released_owner_boosted,
+            )
+        });
         if released && owner_boosted {
             if let Some(owner_thread) = owner_thread.as_ref() {
                 Self::recover_owner_priority(semaphore, kind, owner_thread);
@@ -1161,7 +1178,8 @@ pub unsafe extern "C" fn queue_send_from_isr(
     if !queue.is_null() {
         let ptr = QueuePtr::new(queue.cast()).expect("invalid queue pointer");
         let handle = unsafe { QueueHandle::ref_from_ptr(&ptr) };
-        let ret = handle.try_send_to_back_from_isr(item.cast(), (hptw as *mut bool).as_mut()) as i32;
+        let ret =
+            handle.try_send_to_back_from_isr(item.cast(), (hptw as *mut bool).as_mut()) as i32;
         unsafe { log_pp_queue_item("send_isr", queue, item, ret) };
         if let Some(count) = wifi_os_should_log(&WIFI_OS_QUEUE_LOG_COUNT) {
             log::info!(
@@ -1490,32 +1508,37 @@ pub unsafe extern "C" fn task_get_max_priority() -> i32 {
 /// Rust-side log output function called from C bridge (log_bridge.c).
 /// Receives the fully formatted message string and prints via kernel log.
 #[no_mangle]
-pub unsafe extern "C" fn blueos_wifi_log_output(level: c_uint, tag: *const c_char, msg: *const c_char) {
-    let level_name = match level {
-        0 => "NONE",
-        1 => "ERROR",
-        2 => "WARN",
-        3 => "INFO",
-        4 => "DEBUG",
-        5 => "VERBOSE",
-        _ => "???",
-    };
+pub unsafe extern "C" fn blueos_wifi_log_output(
+    level: c_uint,
+    tag: *const c_char,
+    msg: *const c_char,
+) {
     let tag_str = if tag.is_null() {
         "<null>"
     } else {
         // Safety: tag is a C string from the ESP driver, guaranteed non-null here
-        unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(tag as *const u8, unsafe { libc::strlen(tag) } as usize)) }
+        unsafe {
+            core::str::from_utf8_unchecked(core::slice::from_raw_parts(tag as *const u8, unsafe {
+                libc::strlen(tag)
+            }
+                as usize))
+        }
     };
     let msg_str = if msg.is_null() {
         "<null>"
     } else {
         // Safety: msg is a C string produced by vsnprintf in log_bridge.c
-        unsafe { core::str::from_utf8_unchecked(core::slice::from_raw_parts(msg as *const u8, unsafe { libc::strlen(msg) } as usize)) }
+        unsafe {
+            core::str::from_utf8_unchecked(core::slice::from_raw_parts(msg as *const u8, unsafe {
+                libc::strlen(msg)
+            }
+                as usize))
+        }
     };
     match level {
         1 => log::error!("[ESP_WIFI][{}] {}", tag_str, msg_str),
         2 => log::warn!("[ESP_WIFI][{}] {}", tag_str, msg_str),
-        3 => log::info!("[ESP_WIFI][{}] {}", tag_str, msg_str),
+        3 if wifi_os_diag_log_enabled() => log::info!("[ESP_WIFI][{}] {}", tag_str, msg_str),
         4 if wifi_os_diag_log_enabled() => log::debug!("[ESP_WIFI][{}] {}", tag_str, msg_str),
         _ if wifi_os_diag_log_enabled() => log::trace!("[ESP_WIFI][{}] {}", tag_str, msg_str),
         _ => {}
@@ -1525,13 +1548,23 @@ pub unsafe extern "C" fn blueos_wifi_log_output(level: c_uint, tag: *const c_cha
 extern "C" {
     /// C bridge for _log_writev — formats va_list via vsnprintf and calls
     /// blueos_wifi_log_output. Defined in log_bridge.c.
-    fn wifi_log_writev_bridge(level: c_uint, tag: *const c_char, format: *const c_char, args: *mut c_void);
+    fn wifi_log_writev_bridge(
+        level: c_uint,
+        tag: *const c_char,
+        format: *const c_char,
+        args: *mut c_void,
+    );
     /// C bridge for _log_write — formats varargs and calls wifi_log_writev_bridge.
     /// Defined in log_bridge.c.
     fn wifi_log_write_bridge(level: c_uint, tag: *const c_char, format: *const c_char, ...);
 }
 
-pub unsafe extern "C" fn log_writev(level: c_uint, tag: *const c_char, format: *const c_char, args: *mut c_void) {
+pub unsafe extern "C" fn log_writev(
+    level: c_uint,
+    tag: *const c_char,
+    format: *const c_char,
+    args: *mut c_void,
+) {
     wifi_log_writev_bridge(level, tag, format, args)
 }
 
@@ -1553,11 +1586,11 @@ pub unsafe extern "C" fn free(p: *mut c_void) {
 }
 
 pub unsafe extern "C" fn event_post(
-    event_base: *const core::ffi::c_char,
+    _event_base: *const core::ffi::c_char,
     event_id: i32,
     event_data: *mut c_void,
-    event_data_size: usize,
-    ticks_to_wait: u32,
+    _event_data_size: usize,
+    _ticks_to_wait: u32,
 ) -> i32 {
     use num_traits::FromPrimitive;
 
@@ -1565,14 +1598,6 @@ pub unsafe extern "C" fn event_post(
         log::warn!("Unknown event id: {}", event_id);
         return 0;
     };
-    let important_event = matches!(
-        &event,
-        WifiEvent::ScanDone
-            | WifiEvent::StationConnected
-            | WifiEvent::StationDisconnected
-            | WifiEvent::StationAuthenticationModeChange
-            | WifiEvent::StationBeaconTimeout
-    );
     if wifi_os_diag_log_enabled() {
         log::debug!("Event: {:?}", event);
     }
@@ -1580,24 +1605,13 @@ pub unsafe extern "C" fn event_post(
     let Some(payload) = super::event::EventInfo::from_wifi_event_raw(event, event_data) else {
         return 0;
     };
-    if important_event {
-        log::info!(
-            "WiFi event_post: base={:p} id={} size={} ticks={} payload={:?}",
-            event_base,
-            event_id,
-            event_data_size,
-            ticks_to_wait,
-            payload
-        );
-    } else if wifi_os_diag_log_enabled() {
+    if wifi_os_diag_log_enabled() {
         log::debug!("Event payload: {:?}", payload);
     }
 
     // Forward to async handler only; payload processing stays in async context.
     if let Err(e) = unsafe { super::EVENT_SENDER.assume_init_mut() }.try_send(payload) {
         log::warn!("Event channel full, dropping event: {:?}", e.0);
-    } else if important_event {
-        log::info!("WiFi event_post: queued id={}", event_id);
     }
     0
 }
@@ -1670,7 +1684,8 @@ pub unsafe extern "C" fn read_mac(mac_out: *mut u8, type_: u32) -> i32 {
 
 pub unsafe extern "C" fn ets_timer_arm(timer: *mut c_void, tmout: u32, repeat: bool) {
     let count = wifi_os_next_log_count(&WIFI_OS_TIMER_ARM_LOG_COUNT);
-    let should_log = wifi_os_diag_log_enabled() && (wifi_os_log_count_enabled(count) || tmout >= 1000);
+    let should_log =
+        wifi_os_diag_log_enabled() && (wifi_os_log_count_enabled(count) || tmout >= 1000);
     if should_log {
         let priv_ = (timer as *mut ets_timer)
             .as_ref()
@@ -1796,7 +1811,8 @@ pub unsafe extern "C" fn ets_timer_arm_us(ptimer: *mut c_void, us: u32, repeat: 
     let timer = TimerHandle::ref_from_ptr(&timer);
 
     let count = wifi_os_next_log_count(&WIFI_OS_TIMER_LOG_COUNT);
-    let should_log = wifi_os_diag_log_enabled() && (wifi_os_log_count_enabled(count) || us >= 1_000_000);
+    let should_log =
+        wifi_os_diag_log_enabled() && (wifi_os_log_count_enabled(count) || us >= 1_000_000);
     if should_log {
         log::info!(
             "[WIFI_OS] ets_timer_arm_us#{} timer={:p} wake_null={} priv={:p} us={} repeat={} now_us={}",
@@ -2047,7 +2063,11 @@ pub unsafe extern "C" fn coex_wifi_release(_event: u32) -> i32 {
 
 pub unsafe extern "C" fn coex_wifi_channel_set(_primary: u8, _secondary: u8) -> i32 {
     if wifi_os_diag_log_enabled() {
-        log::info!("[COEX] coex_wifi_channel_set: primary={}, secondary={}", _primary, _secondary);
+        log::info!(
+            "[COEX] coex_wifi_channel_set: primary={}, secondary={}",
+            _primary,
+            _secondary
+        );
     }
     0
 }
@@ -2119,40 +2139,19 @@ pub unsafe extern "C" fn coex_schm_register_cb_wrapper(
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn phy_printf(format: *const c_char, mut __valist: ...) -> core::ffi::c_int {
-    if format.is_null() {
-        return 0;
-    }
-    let s = unsafe { core::ffi::CStr::from_ptr(format) };
-    if let Ok(s) = s.to_str() {
-        crate::kearly_println!("[phy] {}", s);
-    }
+pub unsafe extern "C" fn phy_printf(_format: *const c_char, mut __valist: ...) -> core::ffi::c_int {
     0
 }
 
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn pp_printf(format: *const c_char, mut __valist: ...) -> core::ffi::c_int {
-    if format.is_null() {
-        return 0;
-    }
-    let s = unsafe { core::ffi::CStr::from_ptr(format) };
-    if let Ok(s) = s.to_str() {
-        crate::kearly_println!("[pp] {}", s);
-    }
+pub unsafe extern "C" fn pp_printf(_format: *const c_char, mut __valist: ...) -> core::ffi::c_int {
     0
 }
 
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn net80211_printf(
-    format: *const c_char,
+    _format: *const c_char,
     mut __valist: ...
 ) -> core::ffi::c_int {
-    if format.is_null() {
-        return 0;
-    }
-    let s = unsafe { core::ffi::CStr::from_ptr(format) };
-    if let Ok(s) = s.to_str() {
-        crate::kearly_println!("[net80211] {}", s);
-    }
     0
 }

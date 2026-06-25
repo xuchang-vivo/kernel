@@ -19,10 +19,10 @@ mod wifi_io;
 use crate::{
     arch,
     asynk::{channel, channel::Sender},
-    kearly_println,
     net::{
         link::{
-            mark_scan_results_pending, mark_scan_results_unavailable, update_scan_results_cache,
+            mark_scan_results_pending, mark_scan_results_unavailable, scan_results_ready,
+            update_scan_results_cache,
             wifi_ops::{WifiOps, WifiScanConfig, WifiScanResult},
             HwAddr, LinkLayer, Medium,
         },
@@ -34,32 +34,26 @@ use crate::{
 };
 use alloc::{string::String, vec, vec::Vec};
 use core::{
-    ffi::{c_char, VaList as valist},
     fmt::{Debug, Write},
     mem::MaybeUninit,
-    ptr,
     ptr::addr_of,
     str,
-    sync::atomic::{AtomicU32, Ordering},
 };
 use esp_hal as hal;
 use esp_wifi_sys_esp32c3::include::{
     __BindgenBitfieldUnit, esp_event_base_t, esp_interface_t_ESP_IF_WIFI_AP,
     esp_interface_t_ESP_IF_WIFI_STA, esp_supplicant_init, esp_wifi_connect_internal,
-    esp_wifi_disconnect_internal,
-    esp_wifi_init_internal, esp_wifi_internal_reg_rxcb, esp_wifi_internal_set_log_level,
-    esp_wifi_scan_get_ap_num,
-    esp_wifi_scan_get_ap_records, esp_wifi_scan_start, esp_wifi_set_config, esp_wifi_set_country,
-    esp_wifi_set_mode, esp_wifi_set_protocols, esp_wifi_set_ps, esp_wifi_set_tx_done_cb,
-    esp_wifi_start, g_wifi_default_wpa_crypto_funcs, wifi_ap_record_t, wifi_config_t,
-    wifi_country_policy_t_WIFI_COUNTRY_POLICY_MANUAL, wifi_country_t, wifi_init_config_t,
-    wifi_interface_t_WIFI_IF_STA, wifi_log_level_t_WIFI_LOG_VERBOSE, wifi_mode_t_WIFI_MODE_NULL,
-    wifi_mode_t_WIFI_MODE_STA,
-    wifi_osi_funcs_t, wifi_pmf_config_t, wifi_protocols_t, wifi_ps_type_t_WIFI_PS_NONE,
-    wifi_scan_config_t, wifi_scan_threshold_t, wifi_scan_type_t_WIFI_SCAN_TYPE_ACTIVE,
-    wifi_scan_type_t_WIFI_SCAN_TYPE_PASSIVE, wifi_sort_method_t_WIFI_CONNECT_AP_BY_SIGNAL,
-    wifi_sta_config_t, ESP_OK, ESP_WIFI_OS_ADAPTER_MAGIC, ESP_WIFI_OS_ADAPTER_VERSION,
-    WIFI_INIT_CONFIG_MAGIC,
+    esp_wifi_disconnect_internal, esp_wifi_init_internal, esp_wifi_internal_reg_rxcb,
+    esp_wifi_scan_get_ap_num, esp_wifi_scan_get_ap_records, esp_wifi_scan_start,
+    esp_wifi_set_config, esp_wifi_set_country, esp_wifi_set_mode, esp_wifi_set_protocols,
+    esp_wifi_set_ps, esp_wifi_set_tx_done_cb, esp_wifi_start, g_wifi_default_wpa_crypto_funcs,
+    wifi_ap_record_t, wifi_config_t, wifi_country_policy_t_WIFI_COUNTRY_POLICY_MANUAL,
+    wifi_country_t, wifi_init_config_t, wifi_interface_t_WIFI_IF_STA, wifi_mode_t_WIFI_MODE_NULL,
+    wifi_mode_t_WIFI_MODE_STA, wifi_osi_funcs_t, wifi_pmf_config_t, wifi_protocols_t,
+    wifi_ps_type_t_WIFI_PS_NONE, wifi_scan_config_t, wifi_scan_threshold_t,
+    wifi_scan_type_t_WIFI_SCAN_TYPE_ACTIVE, wifi_scan_type_t_WIFI_SCAN_TYPE_PASSIVE,
+    wifi_sort_method_t_WIFI_CONNECT_AP_BY_SIGNAL, wifi_sta_config_t, ESP_OK,
+    ESP_WIFI_OS_ADAPTER_MAGIC, ESP_WIFI_OS_ADAPTER_VERSION, WIFI_INIT_CONFIG_MAGIC,
 };
 use event::EventInfo;
 use libc::IW_SCAN_TYPE_ACTIVE;
@@ -68,7 +62,7 @@ use smoltcp::{
     iface::{Interface, SocketSet},
     phy::{Device, Medium as SmoltcpMedium},
     time::Instant,
-    wire::HardwareAddress,
+    wire::{HardwareAddress, IpAddress, IpCidr, Ipv4Address},
 };
 use wifi_io::*;
 
@@ -173,7 +167,14 @@ extern "C" fn wifi_inner_init() {
                     log::info!("ScanDone: async handler received event");
                     update_scan_results_from_driver("ScanDone");
                 }
-                EventInfo::StationConnected { ssid, bssid, channel, authmode, aid } => {
+                EventInfo::StationConnected {
+                    ssid,
+                    bssid,
+                    channel,
+                    authmode,
+                    aid,
+                } => {
+                    set_sta_connected(true);
                     log::info!(
                         "WiFi StationConnected: ssid={:?} bssid={:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x} ch={} authmode={} aid={}",
                         ssid, bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5],
@@ -181,6 +182,7 @@ extern "C" fn wifi_inner_init() {
                     );
                 }
                 EventInfo::StationDisconnected { reason, .. } => {
+                    set_sta_connected(false);
                     log::info!("WiFi StationDisconnected: reason={}", reason);
                 }
                 _ => log::debug!("WiFi event: {:?}", event),
@@ -244,13 +246,10 @@ impl WifiController {
                 },
             };
 
-            dump_wifi_eapol_state("apply_sta_config:before_set_config");
             let ret = esp_wifi_set_config(
                 wifi_interface_t_WIFI_IF_STA,
                 &cfg as *const wifi_config_t as *mut wifi_config_t,
             );
-            log::info!("WiFi apply_sta_config: esp_wifi_set_config returned {}", ret);
-            dump_wifi_eapol_state("apply_sta_config:after_set_config");
             if ret != (ESP_OK as i32) {
                 return Err(NetError::NoRoute);
             }
@@ -275,15 +274,11 @@ impl WifiController {
 
         let reset_mode_on_error = ResetModeOnDrop;
 
-        dump_wifi_eapol_state("set_config:before_mode_sta");
         let ret = unsafe { esp_wifi_set_mode(wifi_mode_t_WIFI_MODE_STA) };
-        log::info!("WiFi set_config: esp_wifi_set_mode(STA) returned {}", ret);
-        dump_wifi_eapol_state("set_config:after_mode_sta");
         if ret != (ESP_OK as i32) {
             return Err(NetError::NoRoute);
         }
         Self::apply_sta_config()?;
-        dump_wifi_eapol_state("set_config:after_apply_sta_config");
 
         let p = wifi_protocols_t {
             ghz_2g: (WIFI_PROTOCOL_11B | WIFI_PROTOCOL_11G | WIFI_PROTOCOL_11N) as u16,
@@ -295,24 +290,13 @@ impl WifiController {
                 &p as *const wifi_protocols_t as *mut wifi_protocols_t,
             )
         };
-        log::info!("WiFi set_config: esp_wifi_set_protocols returned {}", ret);
         if ret != (ESP_OK as i32) {
             return Err(NetError::NoRoute);
         }
 
-        dump_wifi_eapol_state("set_config:before_start");
         let ret = unsafe { esp_wifi_start() };
-        log::info!("WiFi set_config: esp_wifi_start returned {}", ret);
-        dump_wifi_eapol_state("set_config:after_start");
         if ret != (ESP_OK as i32) {
             return Err(NetError::NoRoute);
-        }
-
-        // Enable verbose logging from the ESP WiFi driver internals (WPA, scan, etc.)
-        // Without this, wifi_log in libnet80211.a checks g_log_level and silently drops
-        // all messages below the current level (default: NONE).
-        unsafe {
-            esp_wifi_internal_set_log_level(wifi_log_level_t_WIFI_LOG_VERBOSE);
         }
 
         reset_mode_on_error.defuse();
@@ -342,15 +326,15 @@ impl LinkLayer for WifiController {
     }
 
     fn hw_addr(&self) -> Option<HwAddr> {
-        None
+        Some(HwAddr::from_ethernet(self.mac_address()))
     }
 
     fn can_send(&self) -> bool {
-        true
+        sta_can_send()
     }
 
     fn can_recv(&self) -> bool {
-        true
+        sta_can_recv()
     }
 
     fn as_wifi(&mut self) -> Option<&mut dyn WifiOps> {
@@ -372,16 +356,26 @@ impl Device for WifiController {
         &mut self,
         _timestamp: smoltcp::time::Instant,
     ) -> Option<(Self::RxToken<'_>, Self::TxToken<'_>)> {
-        None
+        if !sta_can_send() {
+            return None;
+        }
+
+        sta_rx_token().map(|rx| (rx, WifiTxToken {}))
     }
 
     fn transmit(&mut self, _timestamp: smoltcp::time::Instant) -> Option<Self::TxToken<'_>> {
-        None
+        if sta_can_send() {
+            Some(WifiTxToken {})
+        } else {
+            None
+        }
     }
 
     fn capabilities(&self) -> smoltcp::phy::DeviceCapabilities {
         let mut caps = smoltcp::phy::DeviceCapabilities::default();
         caps.max_transmission_unit = self.mtu();
+        caps.max_burst_size = Some(1);
+        caps.medium = SmoltcpMedium::Ethernet;
         caps
     }
 }
@@ -398,16 +392,18 @@ impl SmoltcpDevice for WifiController {
             self,
             Instant::from_millis(i64::try_from(crate::time::now().as_millis()).unwrap_or(0)),
         );
+        iface.update_ip_addrs(|addrs| {
+            let _ = addrs.push(IpCidr::new(IpAddress::v4(10, 232, 39, 110), 24));
+        });
+        let _ = iface
+            .routes_mut()
+            .add_default_ipv4_route(Ipv4Address::new(10, 232, 39, 109));
         let sockets = SocketSet::new(vec![]);
         (iface, sockets)
     }
 
-    fn poll_smoltcp(
-        &mut self,
-        _timestamp: Instant,
-        iface: &mut Interface,
-        sockets: &mut SocketSet,
-    ) {
+    fn poll_smoltcp(&mut self, timestamp: Instant, iface: &mut Interface, sockets: &mut SocketSet) {
+        iface.poll(timestamp, self, sockets);
     }
 }
 
@@ -429,13 +425,19 @@ impl WifiOps for WifiController {
             log::error!("Failed to start WiFi scan: error code {}", ret);
             Err(NetError::NoRoute)
         } else {
-            update_scan_results_from_driver("scan:blocking");
+            if !scan_results_ready() {
+                update_scan_results_from_driver("scan:blocking");
+            }
             Ok(Vec::new())
         }
     }
 
     fn connect(&mut self, ssid: &str, passphrase: &str) -> Result<(), NetError> {
-        log::info!("WiFi connecting to SSID: {} (passphrase len: {})", ssid, passphrase.len());
+        log::info!(
+            "WiFi connecting to SSID: {} (passphrase len: {})",
+            ssid,
+            passphrase.len()
+        );
 
         let ssid_bytes = ssid.as_bytes();
         if ssid_bytes.len() > 32 {
@@ -479,10 +481,7 @@ impl WifiOps for WifiController {
             // esp_wifi_disconnect_internal resets STA state from "connecting"
             // or "connected" back to "started" (state 1), allowing set_config
             // to proceed.
-            dump_wifi_eapol_state("connect:before_disconnect");
-            let ret = esp_wifi_disconnect_internal();
-            log::info!("WiFi connect: esp_wifi_disconnect_internal returned {}", ret);
-            dump_wifi_eapol_state("connect:after_disconnect");
+            let _ = esp_wifi_disconnect_internal();
 
             // ── Set STA config while WiFi is running ──
             // Per ESP-IDF documentation, esp_wifi_set_config can be called
@@ -499,13 +498,10 @@ impl WifiOps for WifiController {
             // registrations done by esp_supplicant_init), but esp_wifi_start()
             // does NOT re-register them. After stop→start, the supplicant
             // is dead and WPA2 authentication cannot trigger.
-            dump_wifi_eapol_state("connect:before_set_config");
             let ret = esp_wifi_set_config(
                 wifi_interface_t_WIFI_IF_STA,
                 &cfg as *const wifi_config_t as *mut wifi_config_t,
             );
-            log::info!("WiFi connect: esp_wifi_set_config returned {}", ret);
-            dump_wifi_eapol_state("connect:after_set_config");
             if ret != (ESP_OK as i32) {
                 log::error!("WiFi connect: esp_wifi_set_config failed: {}", ret);
                 return Err(NetError::NoRoute);
@@ -519,35 +515,16 @@ impl WifiOps for WifiController {
                 wifi_interface_t_WIFI_IF_STA,
                 &p as *const wifi_protocols_t as *mut wifi_protocols_t,
             );
-            log::info!("WiFi connect: esp_wifi_set_protocols returned {}", ret);
             if ret != (ESP_OK as i32) {
                 log::error!("WiFi connect: esp_wifi_set_protocols failed: {}", ret);
                 return Err(NetError::NoRoute);
             }
-            dump_wifi_eapol_state("connect:after_set_protocols");
 
             // ── Trigger connection ──
-            dump_wifi_eapol_state("connect:before_connect_internal");
             let ret = esp_wifi_connect_internal();
-            log::info!("WiFi connect: esp_wifi_connect_internal returned {}", ret);
-            dump_wifi_eapol_state("connect:after_connect_internal");
-
-
             if ret != (ESP_OK as i32) {
                 log::error!("WiFi connect: esp_wifi_connect_internal failed: {}", ret);
                 return Err(NetError::NoRoute);
-            }
-
-            // Poll EAPOL state every 1s for 10s to observe wpa_type transition
-            // during the 4-way handshake window.
-            // This runs in the ioctl handler thread context — blocking is fine.
-            for i in 1_usize..=10_usize {
-                crate::scheduler::suspend_me_for::<()>(
-                    crate::time::Tick::from_millis(1000),
-                    None,
-                );
-                log::info!("[wifi_eapol_delay] t={}s", i);
-                dump_wifi_eapol_state("connect:delay");
             }
         }
         log::info!("WiFi connect triggered for SSID: {}", ssid);
@@ -559,7 +536,10 @@ impl WifiOps for WifiController {
         unsafe {
             let ret = esp_wifi_disconnect_internal();
             if ret != (ESP_OK as i32) {
-                log::error!("WiFi disconnect: esp_wifi_disconnect_internal failed: {}", ret);
+                log::error!(
+                    "WiFi disconnect: esp_wifi_disconnect_internal failed: {}",
+                    ret
+                );
                 return Err(NetError::NoRoute);
             }
         }
@@ -690,101 +670,6 @@ pub static mut __ESP_RADIO_G_MISC_NVS: *mut u32 = core::ptr::addr_of_mut!(NVS) a
 // pointer directly to the BSS variable, bypassing the linker resolution problem.
 extern "C" {
     static mut g_misc_nvs: *mut u32;
-    static mut g_ic: u8;
-    static mut g_tx_done_cb_func: u32;
-}
-
-static LAST_AUTHMODE: AtomicU32 = AtomicU32::new(u32::MAX);
-static LAST_WPA_TYPE: AtomicU32 = AtomicU32::new(u32::MAX);
-
-fn dump_wifi_eapol_state(tag: &str) {
-    fn readable_data_ptr(addr: u32) -> bool {
-        (0x3c00_0000..0x3c80_0000).contains(&addr)
-            || (0x3fc8_0000..0x3fce_0000).contains(&addr)
-    }
-
-    unsafe {
-        let g_ic_ptr = ptr::addr_of!(g_ic);
-        let g_ic_addr = g_ic_ptr as usize;
-        let wpa_cb = ptr::read_volatile(g_ic_ptr.add(436).cast::<u32>());
-        let eapol_ops = ptr::read_volatile(g_ic_ptr.add(440).cast::<u32>());
-        let path1_ops = ptr::read_volatile(g_ic_ptr.add(444).cast::<u32>());
-        let authmode = ptr::read_volatile(g_ic_ptr.add(509).cast::<u8>());
-        let wpa_type = ptr::read_volatile(g_ic_ptr.add(576).cast::<u32>());
-        let ic_274_ops = ptr::read_volatile(g_ic_ptr.add(628).cast::<u32>());
-        let prev_authmode = LAST_AUTHMODE.swap(authmode as u32, Ordering::Relaxed);
-        let prev_wpa_type = LAST_WPA_TYPE.swap(wpa_type, Ordering::Relaxed);
-        if prev_authmode != authmode as u32 || prev_wpa_type != wpa_type {
-            log::warn!(
-                "wifi_eapol_transition[{}]: authmode {}->{} wpa_type {}->{}",
-                tag,
-                prev_authmode,
-                authmode,
-                prev_wpa_type,
-                wpa_type,
-            );
-        }
-        let ic_e4 = ptr::read_volatile(g_ic_ptr.add(228).cast::<u32>());
-        let nvs = ptr::read_volatile(ptr::addr_of!(g_misc_nvs));
-        let (nvs1, nvs2) = if nvs.is_null() {
-            (0, 0)
-        } else {
-            (
-                ptr::read_volatile(nvs.add(1)),
-                ptr::read_volatile(nvs.add(2)),
-            )
-        };
-        let (eapol_ops0, eapol_ops16) = if readable_data_ptr(eapol_ops) {
-            let p = eapol_ops as *const u8;
-            (
-                ptr::read_volatile(p.cast::<u32>()),
-                ptr::read_volatile(p.add(16).cast::<u32>()),
-            )
-        } else {
-            (0, 0)
-        };
-        let (wpa_cb20, wpa_cb64) = if readable_data_ptr(wpa_cb) {
-            let p = wpa_cb as *const u8;
-            (
-                ptr::read_volatile(p.add(20).cast::<u32>()),
-                ptr::read_volatile(p.add(64).cast::<u32>()),
-            )
-        } else {
-            (0, 0)
-        };
-        let ic_274_ops0 = if readable_data_ptr(ic_274_ops) {
-            ptr::read_volatile((ic_274_ops as *const u8).cast::<u32>())
-        } else {
-            0
-        };
-
-        let eapol_txdone_cb = ptr::read_volatile(g_ic_ptr.add(0x1de8).cast::<u32>());
-        let user_txdone_cb = ptr::read_volatile(ptr::addr_of!(g_tx_done_cb_func));
-
-        log::info!(
-            "wifi_eapol_state[{}]: g_ic=0x{:08x} eapol_txdone_cb(+0x1de8)=0x{:08x} user_txdone_cb=0x{:08x} wake_null_timer(+0x1dec)=0x{:08x} wpa_cb(+436)=0x{:08x} eapol_ops(+440)=0x{:08x} path1_ops(+444)=0x{:08x} authmode(+509)={} wpa_type(+576)={} ic_e4(+228)=0x{:08x} ic_274_ops(+628)=0x{:08x} g_misc_nvs={:p} nvs[1]={} nvs[2]={} eapol_ops[0]=0x{:08x} eapol_ops[16]=0x{:08x} ic_274_ops[0]=0x{:08x} wpa_cb[20]=0x{:08x} wpa_cb[64]=0x{:08x}",
-            tag,
-            g_ic_addr,
-            eapol_txdone_cb,
-            user_txdone_cb,
-            g_ic_addr + 0x1dec,
-            wpa_cb,
-            eapol_ops,
-            path1_ops,
-            authmode,
-            wpa_type,
-            ic_e4,
-            ic_274_ops,
-            nvs,
-            nvs1,
-            nvs2,
-            eapol_ops0,
-            eapol_ops16,
-            ic_274_ops0,
-            wpa_cb20,
-            wpa_cb64,
-        );
-    }
 }
 
 // g_log_level is also a BSS global in libcore.a's misc_nvs.o (4 bytes, initial 0).
@@ -974,46 +859,32 @@ pub fn wifi_init() -> Result<(), NetError> {
             magic: WIFI_INIT_CONFIG_MAGIC as i32,
         });
 
-        dump_wifi_eapol_state("wifi_init:before_init_internal");
         let ret = esp_wifi_init_internal(addr_of!(G_WIFI_CONFIG) as *const wifi_init_config_t);
-        log::info!("WiFi init: esp_wifi_init_internal returned {}", ret);
-        dump_wifi_eapol_state("wifi_init:after_init_internal");
         if ret != (ESP_OK as i32) {
             return Err(NetError::NoRoute);
         }
 
         let ret = esp_wifi_set_mode(wifi_mode_t_WIFI_MODE_NULL);
-        log::info!("WiFi init: esp_wifi_set_mode(NULL) returned {}", ret);
-        dump_wifi_eapol_state("wifi_init:after_mode_null");
         if ret != (ESP_OK as i32) {
             return Err(NetError::NoRoute);
         }
 
         let ret = esp_supplicant_init();
-        log::info!("WiFi init: esp_supplicant_init returned {}", ret);
         if ret != (ESP_OK as i32) {
             return Err(NetError::NoRoute);
         }
 
-        dump_wifi_eapol_state("wifi_init:after_supplicant_init");
-
         let ret = esp_wifi_set_tx_done_cb(Some(esp_wifi_tx_done_cb));
-        log::info!("WiFi init: esp_wifi_set_tx_done_cb returned {}", ret);
-        dump_wifi_eapol_state("wifi_init:after_tx_done_cb");
         if ret != (ESP_OK as i32) {
             return Err(NetError::NoRoute);
         }
 
         let ret = esp_wifi_internal_reg_rxcb(esp_interface_t_ESP_IF_WIFI_STA, Some(recv_cb_sta));
-        log::info!("WiFi init: esp_wifi_internal_reg_rxcb(STA) returned {}", ret);
-        dump_wifi_eapol_state("wifi_init:after_rxcb_sta");
         if ret != (ESP_OK as i32) {
             return Err(NetError::NoRoute);
         }
 
         let ret = esp_wifi_internal_reg_rxcb(esp_interface_t_ESP_IF_WIFI_AP, Some(recv_cb_ap));
-        log::info!("WiFi init: esp_wifi_internal_reg_rxcb(AP) returned {}", ret);
-        dump_wifi_eapol_state("wifi_init:after_rxcb_ap");
         if ret != (ESP_OK as i32) {
             return Err(NetError::NoRoute);
         }
@@ -1036,9 +907,6 @@ pub fn wifi_init() -> Result<(), NetError> {
         }
 
         WifiController::set_config()?;
-        dump_wifi_eapol_state("wifi_init:after_set_config");
-
-        log::debug!("WiFi initialized successfully");
         Ok(())
     }
 }

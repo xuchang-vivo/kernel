@@ -205,6 +205,11 @@ pub(crate) fn mark_scan_results_unavailable() {
     WIFI_SCAN_CACHE_STATE.store(WIFI_SCAN_CACHE_IDLE, Ordering::Release);
 }
 
+/// Check whether the global WiFi scan cache already has ready results.
+pub(crate) fn scan_results_ready() -> bool {
+    WIFI_SCAN_CACHE_STATE.load(Ordering::Acquire) == WIFI_SCAN_CACHE_READY
+}
+
 /// Replace the global WiFi scan cache with the latest results.
 pub(crate) fn update_scan_results_cache(results: Vec<WifiScanResult>) {
     *WIFI_SCAN_CACHE.lock() = Some(results);
@@ -238,7 +243,7 @@ pub(crate) fn copy_scan_results_to_user(
             + 6usize                                 // bssid
             + 1usize                                 // signal_dbm
             + 2usize                                 // channel
-            + 1usize;                                // security
+            + 1usize; // security
     }
 
     if buf.is_null() {
@@ -358,7 +363,10 @@ pub(crate) fn handle_control(cmd: NetIfaceControl) -> Result<NetIfaceResult, Net
             Ok(NetIfaceResult::Void)
         }
         // ── WiFi connect (SIOCSIWESSID) ──
-        NetIfaceControl::WifiConnect { ref ifname, ref ssid } => {
+        NetIfaceControl::WifiConnect {
+            ref ifname,
+            ref ssid,
+        } => {
             let ifname = ifname
                 .iter()
                 .take_while(|&&b| b != 0)
@@ -373,10 +381,7 @@ pub(crate) fn handle_control(cmd: NetIfaceControl) -> Result<NetIfaceResult, Net
                 .as_wifi()
                 .ok_or(NetIfaceError::DeviceTraitNotAvailable)?;
 
-            let passphrase = WIFI_PASSPHRASE_CACHE
-                .lock()
-                .take()
-                .unwrap_or_default();
+            let passphrase = WIFI_PASSPHRASE_CACHE.lock().take().unwrap_or_default();
 
             wifi.connect(ssid, &passphrase)
                 .map_err(|_| NetIfaceError::DeviceTraitNotAvailable)?;

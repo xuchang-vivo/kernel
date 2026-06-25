@@ -68,7 +68,7 @@ pub(crate) fn init() {
         let device = Arc::new(spin::RwLock::new(
             crate::boards::seeed_xiao_esp32c3::wifi::WifiController::new(),
         ));
-        devices.push(("wlan0", false, device));
+        devices.push(("wlan0", true, device));
     }
     // DEVICE_ENTRY here must match DeviceEntry in smoltcp/mod.rs.
     smoltcp::init_devices(&devices);

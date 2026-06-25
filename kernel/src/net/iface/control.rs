@@ -137,8 +137,13 @@ impl NetIfaceControl {
                 }
 
                 let iwreq_arg = arg + 16;
-                let essid_ptr = unsafe { ptr::read_unaligned(iwreq_arg as *const *mut core::ffi::c_void) };
-                let essid_len = unsafe { ptr::read_unaligned((iwreq_arg + core::mem::size_of::<*mut core::ffi::c_void>()) as *const u16) } as usize;
+                let essid_ptr =
+                    unsafe { ptr::read_unaligned(iwreq_arg as *const *mut core::ffi::c_void) };
+                let essid_len = unsafe {
+                    ptr::read_unaligned(
+                        (iwreq_arg + core::mem::size_of::<*mut core::ffi::c_void>()) as *const u16,
+                    )
+                } as usize;
 
                 // When length > IW_ESSID_MAX_SIZE (32), the pointer is to a
                 // struct iw_scan_req whose first byte is scan_type. When
@@ -151,13 +156,21 @@ impl NetIfaceControl {
 
                 let mut buf = [0u8; 32];
                 if !essid_ptr.is_null() && essid_len > 0 && essid_len <= 32 {
-                    unsafe { ptr::copy_nonoverlapping(essid_ptr as *const u8, buf.as_mut_ptr(), essid_len); }
+                    unsafe {
+                        ptr::copy_nonoverlapping(
+                            essid_ptr as *const u8,
+                            buf.as_mut_ptr(),
+                            essid_len,
+                        );
+                    }
                 }
 
                 Ok(NetIfaceControl::WifiScan(WifiScanConfig {
                     ifname: ifrn_name,
                     ssid: if essid_len > 0 && essid_len <= 32 && !essid_ptr.is_null() {
-                        Some(unsafe { core::str::from_utf8_unchecked(&buf[..essid_len]).to_owned() })
+                        Some(unsafe {
+                            core::str::from_utf8_unchecked(&buf[..essid_len]).to_owned()
+                        })
                     } else {
                         None
                     },
@@ -178,8 +191,11 @@ impl NetIfaceControl {
                 let iwreq_arg = arg + 16;
                 let enc_ptr =
                     unsafe { ptr::read_unaligned(iwreq_arg as *const *mut core::ffi::c_void) };
-                let enc_len =
-                    unsafe { ptr::read_unaligned((iwreq_arg + core::mem::size_of::<*mut core::ffi::c_void>()) as *const u16) } as usize;
+                let enc_len = unsafe {
+                    ptr::read_unaligned(
+                        (iwreq_arg + core::mem::size_of::<*mut core::ffi::c_void>()) as *const u16,
+                    )
+                } as usize;
 
                 let passphrase = if !enc_ptr.is_null() && enc_len > 0 && enc_len <= 64 {
                     let mut buf = [0u8; 64];
@@ -209,20 +225,30 @@ impl NetIfaceControl {
                 let iwreq_arg = arg + 16;
                 let essid_ptr =
                     unsafe { ptr::read_unaligned(iwreq_arg as *const *mut core::ffi::c_void) };
-                let essid_len =
-                    unsafe { ptr::read_unaligned((iwreq_arg + core::mem::size_of::<*mut core::ffi::c_void>()) as *const u16) } as usize;
+                let essid_len = unsafe {
+                    ptr::read_unaligned(
+                        (iwreq_arg + core::mem::size_of::<*mut core::ffi::c_void>()) as *const u16,
+                    )
+                } as usize;
 
                 let ssid = if !essid_ptr.is_null() && essid_len > 0 && essid_len <= 32 {
                     let mut buf = [0u8; 32];
                     unsafe {
-                        ptr::copy_nonoverlapping(essid_ptr as *const u8, buf.as_mut_ptr(), essid_len);
+                        ptr::copy_nonoverlapping(
+                            essid_ptr as *const u8,
+                            buf.as_mut_ptr(),
+                            essid_len,
+                        );
                     }
                     String::from_utf8_lossy(&buf[..essid_len]).into_owned()
                 } else {
                     String::new()
                 };
 
-                Ok(NetIfaceControl::WifiConnect { ifname: ifrn_name, ssid })
+                Ok(NetIfaceControl::WifiConnect {
+                    ifname: ifrn_name,
+                    ssid,
+                })
             }
             // SIOCADDRT / SIOCDELRT — routing (not yet implemented)
             _ => Err(NetIfaceError::NotSupported),
