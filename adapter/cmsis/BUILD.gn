@@ -30,7 +30,7 @@ adapter_deps = [
 build_rust("cmsis_adapter") {
   sources = [ "src/lib.rs" ]
   edition = "2021"
-  proc_macro_deps = [ "//external/vendor/delegate-0.13.4:delegate" ]
+  proc_macro_deps = [ "//external/vendor/delegate-0.13.5:delegate" ]
   deps = adapter_deps
   deps += [ "//kernel/kconfig:generate_rustflags_file" ]
   configs += [ "//kernel/kconfig:kconfigs" ]
@@ -47,7 +47,7 @@ build_rust("cmsis_adapter_unittest") {
   sources = [ "src/lib.rs" ]
   edition = "2021"
   proc_macro_deps = [
-    "//external/vendor/delegate-0.13.4:delegate",
+    "//external/vendor/delegate-0.13.5:delegate",
     "//kernel/test_harness:blueos_test_macro",
   ]
   deps = adapter_deps
@@ -104,7 +104,7 @@ build_rust("adapter_validation") {
   sources = [ "src/validation.rs" ]
   edition = "2021"
   proc_macro_deps = [
-    "//external/vendor/delegate-0.13.4:delegate",
+    "//external/vendor/delegate-0.13.5:delegate",
     "//kernel/test_harness:blueos_test_macro",
   ]
   deps = validation_deps

@@ -20,6 +20,24 @@ use crate::{
 use blueos_driver::uart::esp32_usb_serial::Esp32UsbSerialIsr;
 use blueos_hal::{isr::IsrDesc, Has8bitDataReg};
 
+pub type Spi2Impl =
+    blueos_driver::spi::esp32c6_spi::Esp32c6Spi2<0x6008_1000, 0x6009_6000, 80_000_000>;
+
+#[cfg(co5300_panel_216inch)]
+type Co5300PanelSpec = display_driver_co5300::spec::Amoled_216Inch_480x480;
+#[cfg(co5300_panel_am196)]
+type Co5300PanelSpec = display_driver_co5300::spec::AM196Q410502LK_196;
+#[cfg(co5300_panel_am178)]
+type Co5300PanelSpec = display_driver_co5300::spec::AM178Q368448LK_178;
+#[cfg(co5300_panel_am151)]
+type Co5300PanelSpec = display_driver_co5300::spec::AM151Q466466LK_151_C;
+#[cfg(co5300_panel_am200)]
+type Co5300PanelSpec = display_driver_co5300::spec::AM200Q460460LK_200;
+#[cfg(co5300_panel_h0198)]
+type Co5300PanelSpec = display_driver_co5300::spec::H0198S005AMT005_V0_195;
+#[cfg(co5300_panel_185inch)]
+type Co5300PanelSpec = display_driver_co5300::spec::Amoled_185Inch_390x450;
+
 pub type ClockImpl =
     blueos_driver::systimer::esp32_sys_timer::Esp32SysTimer<0x6000_a000, 16_000_000>;
 
@@ -777,9 +795,166 @@ pub(crate) fn init() {
 crate::define_peripheral! {
     (console_uart, blueos_driver::uart::esp32_usb_serial::Esp32UsbSerial<0x6000_F000>,
      blueos_driver::uart::esp32_usb_serial::Esp32UsbSerial::<0x6000_F000>::new()),
+    (spi2, Spi2Impl, Spi2Impl::new()),
+    (lcd_cs, blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
+     blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin::new(
+         blueos_kconfig::CONFIG_CO5300_CS_GPIO as u8)),
 }
 
+crate::define_bus! {
+    (spi2_bus, crate::devices::spi_core::block_spi::BlockSpi<
+        Spi2Impl,
+        blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
+    >,
+        #[cfg(co5300)]
+        (co5300, crate::drivers::lcd::co5300::Co5300Config<
+            blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
+            Co5300PanelSpec,
+        >,
+            crate::drivers::lcd::co5300::Co5300Config::new(
+                get_device!(lcd_cs),
+            )
+        ),
+    ),
+}
+
+#[cfg(co5300)]
+crate::define_pin_states!(
+    blueos_driver::pinctrl::esp32c6_pinctrl::Esp32c6IoMuxPinctrl,
+    (
+        blueos_kconfig::CONFIG_CO5300_SCLK_GPIO as u8,
+        1,
+        false,
+        false,
+        false,
+        2,
+        Some(63),
+        None,
+        false,
+        false
+    ),
+    (
+        blueos_kconfig::CONFIG_CO5300_SIO0_GPIO as u8,
+        1,
+        false,
+        false,
+        false,
+        2,
+        Some(65),
+        None,
+        false,
+        false
+    ),
+    (
+        blueos_kconfig::CONFIG_CO5300_SIO1_GPIO as u8,
+        1,
+        false,
+        false,
+        false,
+        2,
+        Some(64),
+        None,
+        false,
+        false
+    ),
+    (
+        blueos_kconfig::CONFIG_CO5300_SIO2_GPIO as u8,
+        1,
+        false,
+        false,
+        false,
+        2,
+        Some(67),
+        None,
+        false,
+        false
+    ),
+    (
+        blueos_kconfig::CONFIG_CO5300_SIO3_GPIO as u8,
+        1,
+        false,
+        false,
+        false,
+        2,
+        Some(66),
+        None,
+        false,
+        false
+    ),
+    (
+        blueos_kconfig::CONFIG_CO5300_CS_GPIO as u8,
+        1,
+        false,
+        true,
+        false,
+        2,
+        Some(128),
+        None,
+        true,
+        false
+    ),
+);
+
+#[cfg(not(co5300))]
 crate::define_pin_states!(None);
+
+#[cfg(spi_core)]
+type Spi2Bus = crate::devices::bus::Bus<
+    crate::devices::spi_core::block_spi::BlockSpi<
+        Spi2Impl,
+        blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
+    >,
+>;
+
+#[cfg(spi_core)]
+static SPI2_BUS: spin::Once<alloc::sync::Arc<Spi2Bus>> = spin::Once::new();
+
+#[cfg(spi_core)]
+fn init_spi2_bus() -> crate::drivers::Result<&'static alloc::sync::Arc<Spi2Bus>> {
+    use crate::devices::{bus::Bus, spi_core::block_spi::BlockSpi};
+    use blueos_driver::spi::SpiConfig;
+
+    if let Some(bus) = SPI2_BUS.get() {
+        return Ok(bus);
+    }
+
+    let block = BlockSpi::new(
+        get_device!(spi2),
+        get_device!(lcd_cs),
+        &SpiConfig::qspi_display_default(),
+    )
+    .map_err(|_| crate::error::code::EIO)?;
+    SPI2_BUS.call_once(|| alloc::sync::Arc::new(Bus::new(block)));
+    SPI2_BUS.get().ok_or(crate::error::code::EIO)
+}
+
+#[cfg(spi_core)]
+pub(crate) fn init_spi_bus() {
+    use crate::drivers::InitDriver;
+
+    let bus = init_spi2_bus().expect("failed to initialize ESP32-C6 SPI2");
+    for device in crate::boards::get_bus_devices!(spi2_bus) {
+        bus.register_device(device)
+            .expect("failed to register ESP32-C6 SPI2 device");
+    }
+
+    #[cfg(co5300)]
+    if let Ok(driver) = bus.probe_driver(&crate::drivers::lcd::co5300::Co5300DriverModule::<
+        blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
+        Co5300PanelSpec,
+    >::new())
+    {
+        if let Err(error) = driver.init(bus) {
+            kearly_println!("Failed to initialize CO5300 driver: {}", error);
+            log::warn!("Failed to initialize CO5300 driver: {}", error);
+        } else {
+            kearly_println!("CO5300 framebuffer registered");
+        }
+    }
+}
+
+pub(crate) fn init_i2c_bus() {}
+pub(crate) fn init_gpio() {}
 
 #[inline(always)]
 pub(crate) fn send_ipi(_hart: usize) {}

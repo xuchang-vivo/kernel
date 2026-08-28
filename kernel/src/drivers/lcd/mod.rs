@@ -27,6 +27,8 @@ const LCD_BYTES_PER_PIXEL: u32 = LCD_BITS_PER_PIXEL / 8;
 const FB_TYPE_PACKED_PIXELS: u32 = 0;
 const FB_VISUAL_TRUECOLOR: u32 = 2;
 
+#[cfg(co5300)]
+pub mod co5300;
 #[cfg(st7789)]
 pub mod st7789;
 #[cfg(st7796)]

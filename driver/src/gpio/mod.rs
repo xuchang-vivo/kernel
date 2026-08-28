@@ -14,3 +14,6 @@
 
 #[cfg(soc_esp32c3)]
 pub mod esp32_gpio;
+
+#[cfg(soc_esp32c6)]
+pub mod esp32c6_gpio;

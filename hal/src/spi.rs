@@ -23,3 +23,19 @@ pub trait Spi<P, T>: super::PlatPeri + super::Configuration<P, Target = T> {
     /// Half-duplex write, discarding MISO.
     fn write(&self, buf: &[u8]) -> super::err::Result<()>;
 }
+
+/// Optional quad-output capability for display controllers connected through QSPI.
+///
+/// Implementations must keep chip-select ownership outside the peripheral. This
+/// lets a display bus combine a single-line command/address header and a quad
+/// pixel payload in one transaction.
+pub trait Qspi {
+    fn write_quad(&self, buf: &[u8]) -> super::err::Result<()>;
+
+    /// Send a four-byte single-line command/address header followed by a
+    /// quad-line payload while the caller owns chip select.
+    ///
+    /// Implementations may split the payload at the hardware FIFO boundary;
+    /// CS must remain asserted for the complete operation.
+    fn write_qspi(&self, header: &[u8; 4], data: &[u8]) -> super::err::Result<()>;
+}

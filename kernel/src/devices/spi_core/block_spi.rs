@@ -64,6 +64,29 @@ impl<T: blueos_hal::spi::Spi<SpiConfig, ()>, G: blueos_hal::gpio::OutputPin> Blo
     }
 }
 
+impl<T: blueos_hal::spi::Spi<SpiConfig, ()> + blueos_hal::spi::Qspi, G: blueos_hal::gpio::OutputPin>
+    BlockSpi<T, G>
+{
+    pub fn write_quad(&mut self, words: &[u8]) -> Result<(), crate::error::Error> {
+        self.inner
+            .write_quad(words)
+            .map_err(|_| crate::error::code::EIO)
+    }
+
+    /// Send the QSPI command/address header plus payload. As with `write` and
+    /// `write_quad`, chip select is owned by the caller so a bus adapter can
+    /// combine multiple operations in one transaction.
+    pub fn write_qspi(
+        &mut self,
+        header: &[u8; 4],
+        words: &[u8],
+    ) -> Result<(), crate::error::Error> {
+        self.inner
+            .write_qspi(header, words)
+            .map_err(|_| crate::error::code::EIO)
+    }
+}
+
 impl<T: blueos_hal::spi::Spi<SpiConfig, ()>, G: blueos_hal::gpio::OutputPin> BusInterface
     for BlockSpi<T, G>
 {

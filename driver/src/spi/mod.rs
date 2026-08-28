@@ -15,6 +15,9 @@
 #[cfg(soc_esp32c3)]
 pub mod esp32_spi;
 
+#[cfg(soc_esp32c6)]
+pub mod esp32c6_spi;
+
 /// SPI clock phase (CPHA).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpiPhase {
@@ -50,6 +53,17 @@ impl SpiConfig {
     pub fn spi_flash_default() -> Self {
         SpiConfig {
             baudrate: 20_000_000,
+            phase: SpiPhase::Phase0,
+            polarity: SpiPolarity::Low,
+            bit_order: SpiBitOrder::MsbFirst,
+            cs_pin: None,
+        }
+    }
+
+    /// Mode 0, MSB-first, 40 MHz for QSPI-connected display panels.
+    pub fn qspi_display_default() -> Self {
+        SpiConfig {
+            baudrate: 40_000_000,
             phase: SpiPhase::Phase0,
             polarity: SpiPolarity::Low,
             bit_order: SpiBitOrder::MsbFirst,

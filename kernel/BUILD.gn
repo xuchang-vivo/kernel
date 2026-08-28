@@ -51,6 +51,9 @@ _shared_deps = [
   "//external/vendor/const-default-1.0.0:const_default",
   "//external/vendor/embedded-hal-1.0.0:embedded_hal",
   "//external/vendor/embedded-hal-bus-0.3.0:embedded_hal_bus",
+  "//external/vendor/embedded-hal-async-1.0.0:embedded_hal_async",
+  "//external/vendor/display-driver-0.1.0:display_driver",
+  "//external/vendor/display-driver-co5300-0.1.1:display_driver_co5300",
   "//external/vendor/embedded-io-0.6.1:embedded_io",
   "//external/vendor/heapless-0.8.0:heapless",
   "//external/vendor/log-0.4.28:log",
@@ -92,7 +95,7 @@ build_rust("kernel_unittest") {
   sources = [ "src/lib.rs" ]
   edition = "2021"
   proc_macro_deps = [
-    "//external/vendor/delegate-0.13.4:delegate",
+    "//external/vendor/delegate-0.13.5:delegate",
     "//external/vendor/num-derive-0.4.2:num_derive",
     "//external/vendor/paste-1.0.15:paste",
     "//kernel/macro:blueos_macro",
@@ -165,7 +168,7 @@ build_rust("blueos") {
   sources = [ "src/lib.rs" ]
   edition = "2021"
   proc_macro_deps = [
-    "//external/vendor/delegate-0.13.4:delegate",
+    "//external/vendor/delegate-0.13.5:delegate",
     "//external/vendor/num-derive-0.4.2:num_derive",
     "//external/vendor/paste-1.0.15:paste",
     "//kernel/macro:blueos_macro",

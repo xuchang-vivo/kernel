@@ -106,7 +106,7 @@ impl<T: blueos_hal::spi::Spi<SpiConfig, ()>, G: blueos_hal::gpio::OutputPin>
 
 impl<
         G1: blueos_hal::gpio::OutputPin,
-        G2: embedded_hal::digital::OutputPin + Send + 'static,
+        G2: embedded_hal::digital::OutputPin + 'static,
         T: blueos_hal::spi::Spi<SpiConfig, ()>,
     > super::Lcd
     for Display<SpiInterface<'static, ExclusiveSpiWithCs<T, G1>, G2>, ST7789, GeneralGpio<G1>>

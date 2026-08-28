@@ -24,5 +24,74 @@ config SOC_ESP32C6
     select RISCV
     select HAS_MIE
 
+config LCD
+    bool "Enable LCD device"
+    default n
+    select SPI_CORE
+    select USE_EMBEDDED_HAL_V1
+
+if LCD
+  choice
+    prompt "LCD controller"
+    default CO5300
+
+    config CO5300
+        bool "Enable LCD CO5300"
+        help
+          Enable the CO5300 QSPI AMOLED controller.
+  endchoice
+
+  if CO5300
+    choice
+      prompt "CO5300 panel"
+      default CO5300_PANEL_216INCH
+
+      config CO5300_PANEL_216INCH
+        bool "2.16-inch AMOLED (480x480)"
+      config CO5300_PANEL_AM196
+        bool "AM196Q410502LK (410x502)"
+      config CO5300_PANEL_AM178
+        bool "AM178Q368448LK (368x448)"
+      config CO5300_PANEL_AM151
+        bool "AM151Q466466LK (466x466)"
+      config CO5300_PANEL_AM200
+        bool "AM200Q460460LK (460x460)"
+      config CO5300_PANEL_H0198
+        bool "H0198S005AMT005 (410x502)"
+      config CO5300_PANEL_185INCH
+        bool "1.85-inch AMOLED (390x450)"
+    endchoice
+  endif
+endif
+
+config USE_EMBEDDED_HAL_V1
+    bool "Implement embedded-hal 1.0 adapters"
+    default y
+
+config CO5300_SCLK_GPIO
+    int "CO5300 QSPI clock GPIO"
+    default 0
+    range 0 30
+config CO5300_SIO0_GPIO
+    int "CO5300 QSPI SIO0 GPIO"
+    default 1
+    range 0 30
+config CO5300_SIO1_GPIO
+    int "CO5300 QSPI SIO1 GPIO"
+    default 2
+    range 0 30
+config CO5300_SIO2_GPIO
+    int "CO5300 QSPI SIO2 GPIO"
+    default 3
+    range 0 30
+config CO5300_SIO3_GPIO
+    int "CO5300 QSPI SIO3 GPIO"
+    default 4
+    range 0 30
+config CO5300_CS_GPIO
+    int "CO5300 chip-select GPIO"
+    default 15
+    range 0 30
+
 config NUM_IRQS
     default 31
