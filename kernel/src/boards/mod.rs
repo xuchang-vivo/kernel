@@ -62,9 +62,9 @@ macro_rules! define_peripheral {
 
 #[macro_export]
 macro_rules! define_pin_states {
-    ($class_name:ty, $( ( $($v:expr),* $(,)? ) ),* $(,)?) => {
+    ($class_name:ty, $( $(#[$pin_meta:meta])* ( $($v:expr),* $(,)? ) ),* $(,)?) => {
         pub(crate) const PIN_STATES: &[&$class_name] = &[
-            $( &<$class_name>::new( $($v),* ), )*
+            $( $(#[$pin_meta])* &<$class_name>::new( $($v),* ), )*
         ];
     };
     (None) => {

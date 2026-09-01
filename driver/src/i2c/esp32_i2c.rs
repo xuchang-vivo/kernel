@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! ESP32-C3 I2C0 register definitions.
+//! ESP32-C3/C6 I2C0 register definitions.
 
 use core::cell::UnsafeCell;
 
@@ -357,10 +357,15 @@ fn calculate_timing(source_clk: u32, baudrate: u32) -> blueos_hal::err::Result<T
     Ok(timing)
 }
 
-/// ESP32-C3 I2C master controller.
+/// ESP32-C3/C6 I2C master controller.
 pub struct Esp32I2c {
     registers: StaticRef<I2cRegisters>,
     system_registers: StaticRef<SystemRegisters>,
+    /// ESP32-C6 moved the I2C clock/reset gate from SYSTEM to PCR. Keep the
+    /// base address separately because the C3 SYSTEM register layout is still
+    /// used by the original constructor.
+    system_base: usize,
+    c6_pcr: bool,
     source_clk: u32,
     state: UnsafeCell<TransactionState>,
 }
@@ -370,6 +375,23 @@ impl Esp32I2c {
         Self {
             registers: unsafe { StaticRef::new(base as *const I2cRegisters) },
             system_registers: unsafe { StaticRef::new(system_base as *const SystemRegisters) },
+            system_base,
+            c6_pcr: false,
+            source_clk,
+            state: UnsafeCell::new(TransactionState::new()),
+        }
+    }
+
+    /// Construct an I2C0 controller for ESP32-C6, whose clock/reset controls
+    /// live in PCR.I2C0_CONF (offset 0x20) instead of the C3 SYSTEM block.
+    pub const fn new_c6(base: usize, pcr_base: usize, source_clk: u32) -> Self {
+        Self {
+            registers: unsafe { StaticRef::new(base as *const I2cRegisters) },
+            // This field is never dereferenced in C6 mode; retain a valid
+            // value so the representation remains uniform with `new`.
+            system_registers: unsafe { StaticRef::new(pcr_base as *const SystemRegisters) },
+            system_base: pcr_base,
+            c6_pcr: true,
             source_clk,
             state: UnsafeCell::new(TransactionState::new()),
         }
@@ -624,6 +646,38 @@ unsafe impl Sync for Esp32I2c {}
 
 impl PlatPeri for Esp32I2c {
     fn enable(&self) {
+        if self.c6_pcr {
+            // PCR.I2C0_CONF: bit0 enables the APB clock and bit1 is active
+            // high when the peripheral is out of reset (reset value 0x01).
+            const PCR_I2C0_CONF: usize = 0x20;
+            const PCR_I2C_SCLK_CONF: usize = 0x24;
+            const I2C0_CLK_EN: u32 = 1 << 0;
+            const I2C0_RST_EN: u32 = 1 << 1;
+            const I2C_SCLK_EN: u32 = 1 << 22;
+            let addr = self.system_base + PCR_I2C0_CONF;
+            let sclk_addr = self.system_base + PCR_I2C_SCLK_CONF;
+            let sclk = unsafe { core::ptr::read_volatile(sclk_addr as *const u32) };
+            unsafe {
+                // C6's function clock is sourced from XTAL by default. It
+                // still needs its explicit gate enabled when the peripheral
+                // is brought up after reset.
+                core::ptr::write_volatile(sclk_addr as *mut u32, sclk | I2C_SCLK_EN);
+            }
+            let conf = unsafe { core::ptr::read_volatile(addr as *const u32) };
+            unsafe {
+                let enabled = conf | I2C0_CLK_EN;
+                // ESP-IDF's ESP32-C6 i2c_ll_reset_register() uses a high
+                // pulse: write 1 to I2C0_RST_EN, then clear it.  Leaving the
+                // bit high keeps I2C0 held in reset even though its APB clock
+                // is enabled, which manifests as a NACK/timeout from every
+                // CST9220 transaction.
+                core::ptr::write_volatile(addr as *mut u32, enabled | I2C0_RST_EN);
+                core::ptr::write_volatile(addr as *mut u32, enabled & !I2C0_RST_EN);
+            }
+            self.registers.ctr.modify(CTR::CLK_EN::SET);
+            return;
+        }
+
         self.system_registers
             .perip_clk_en0
             .modify(PERIP_CLK_EN0::I2C_EXT0_CLK_EN::SET);
@@ -637,6 +691,23 @@ impl PlatPeri for Esp32I2c {
     }
 
     fn disable(&self) {
+        if self.c6_pcr {
+            const PCR_I2C0_CONF: usize = 0x20;
+            const PCR_I2C_SCLK_CONF: usize = 0x24;
+            const I2C0_CLK_EN: u32 = 1 << 0;
+            const I2C_SCLK_EN: u32 = 1 << 22;
+            let addr = self.system_base + PCR_I2C0_CONF;
+            let sclk_addr = self.system_base + PCR_I2C_SCLK_CONF;
+            let conf = unsafe { core::ptr::read_volatile(addr as *const u32) };
+            let sclk = unsafe { core::ptr::read_volatile(sclk_addr as *const u32) };
+            unsafe {
+                core::ptr::write_volatile(addr as *mut u32, conf & !I2C0_CLK_EN);
+                core::ptr::write_volatile(sclk_addr as *mut u32, sclk & !I2C_SCLK_EN);
+            }
+            self.registers.ctr.modify(CTR::CLK_EN::CLEAR);
+            return;
+        }
+
         self.registers.ctr.modify(CTR::CLK_EN::CLEAR);
         self.system_registers
             .perip_clk_en0
@@ -651,10 +722,12 @@ impl Configuration<super::I2cConfig> for Esp32I2c {
         self.enable();
 
         self.registers.ctr.write(
-            // Match esp-hal/ESP-IDF: use direct peripheral output together with
-            // GPIO_PINn_PAD_DRIVER=open-drain on SDA and SCL.
-            CTR::SDA_FORCE_OUT::SET
-                + CTR::SCL_FORCE_OUT::SET
+            // ESP32-C6's `i2c_ll_enable_pins_open_drain(true)` clears these
+            // bits (the C3 peripheral has the opposite polarity).  With the
+            // GPIO pads configured as open-drain, clearing FORCE_OUT lets the
+            // controller release SDA/SCL for ACKs and clock stretching.
+            CTR::SDA_FORCE_OUT::CLEAR
+                + CTR::SCL_FORCE_OUT::CLEAR
                 + CTR::MS_MODE::Master
                 + CTR::TX_LSB_FIRST::CLEAR
                 + CTR::RX_LSB_FIRST::CLEAR

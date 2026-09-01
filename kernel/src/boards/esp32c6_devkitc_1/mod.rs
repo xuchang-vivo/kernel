@@ -796,9 +796,18 @@ crate::define_peripheral! {
     (console_uart, blueos_driver::uart::esp32_usb_serial::Esp32UsbSerial<0x6000_F000>,
      blueos_driver::uart::esp32_usb_serial::Esp32UsbSerial::<0x6000_F000>::new()),
     (spi2, Spi2Impl, Spi2Impl::new()),
+    (i2c0, blueos_driver::i2c::esp32_i2c::Esp32I2c,
+     blueos_driver::i2c::esp32_i2c::Esp32I2c::new_c6(
+         0x6000_4000,
+         0x6009_6000,
+         40_000_000,
+     )),
     (lcd_cs, blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
      blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin::new(
          blueos_kconfig::CONFIG_CO5300_CS_GPIO as u8)),
+    (touch_rst, blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
+     blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin::new(
+         blueos_kconfig::CONFIG_CST9220_RST_GPIO as u8)),
 }
 
 crate::define_bus! {
@@ -816,11 +825,24 @@ crate::define_bus! {
             )
         ),
     ),
+    (i2c0_bus, crate::devices::i2c_core::block_i2c::BlockI2c<
+        blueos_driver::i2c::esp32_i2c::Esp32I2c,
+    >,
+        #[cfg(cst9220)]
+        (cst9220, crate::drivers::input::cst9220::Cst9220Config<
+            blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
+        >,
+            crate::drivers::input::cst9220::Cst9220Config {
+                rst: get_device!(touch_rst),
+            }
+        ),
+    ),
 }
 
-#[cfg(co5300)]
+#[cfg(any(co5300, cst9220))]
 crate::define_pin_states!(
     blueos_driver::pinctrl::esp32c6_pinctrl::Esp32c6IoMuxPinctrl,
+    #[cfg(co5300)]
     (
         blueos_kconfig::CONFIG_CO5300_SCLK_GPIO as u8,
         1,
@@ -833,6 +855,7 @@ crate::define_pin_states!(
         false,
         false
     ),
+    #[cfg(co5300)]
     (
         blueos_kconfig::CONFIG_CO5300_SIO0_GPIO as u8,
         1,
@@ -845,6 +868,7 @@ crate::define_pin_states!(
         false,
         false
     ),
+    #[cfg(co5300)]
     (
         blueos_kconfig::CONFIG_CO5300_SIO1_GPIO as u8,
         1,
@@ -857,6 +881,7 @@ crate::define_pin_states!(
         false,
         false
     ),
+    #[cfg(co5300)]
     (
         blueos_kconfig::CONFIG_CO5300_SIO2_GPIO as u8,
         1,
@@ -869,6 +894,7 @@ crate::define_pin_states!(
         false,
         false
     ),
+    #[cfg(co5300)]
     (
         blueos_kconfig::CONFIG_CO5300_SIO3_GPIO as u8,
         1,
@@ -881,6 +907,7 @@ crate::define_pin_states!(
         false,
         false
     ),
+    #[cfg(co5300)]
     (
         blueos_kconfig::CONFIG_CO5300_CS_GPIO as u8,
         1,
@@ -893,9 +920,63 @@ crate::define_pin_states!(
         true,
         false
     ),
+    // CST9220 uses the board's ESP32_SDA line.
+    #[cfg(cst9220)]
+    (
+        blueos_kconfig::CONFIG_CST9220_SDA_GPIO as u8,
+        1,
+        true,
+        true,
+        false,
+        2,
+        Some(46),
+        Some(46),
+        false,
+        true
+    ),
+    // CST9220 uses the board's ESP32_SCL line.
+    #[cfg(cst9220)]
+    (
+        blueos_kconfig::CONFIG_CST9220_SCL_GPIO as u8,
+        1,
+        true,
+        true,
+        false,
+        2,
+        Some(45),
+        Some(45),
+        false,
+        true
+    ),
+    #[cfg(cst9220)]
+    (
+        blueos_kconfig::CONFIG_CST9220_INT_GPIO as u8,
+        1,
+        true,
+        true,
+        false,
+        2,
+        None,
+        None,
+        false,
+        false
+    ),
+    #[cfg(cst9220)]
+    (
+        blueos_kconfig::CONFIG_CST9220_RST_GPIO as u8,
+        1,
+        false,
+        false,
+        false,
+        2,
+        None,
+        None,
+        true,
+        false
+    ),
 );
 
-#[cfg(not(co5300))]
+#[cfg(not(any(co5300, cst9220)))]
 crate::define_pin_states!(None);
 
 #[cfg(spi_core)]
@@ -953,7 +1034,55 @@ pub(crate) fn init_spi_bus() {
     }
 }
 
-pub(crate) fn init_i2c_bus() {}
+#[cfg(i2c_core)]
+type I2c0Bus = crate::devices::bus::Bus<
+    crate::devices::i2c_core::block_i2c::BlockI2c<blueos_driver::i2c::esp32_i2c::Esp32I2c>,
+>;
+
+#[cfg(i2c_core)]
+static I2C0_BUS: spin::Once<alloc::sync::Arc<I2c0Bus>> = spin::Once::new();
+
+#[cfg(i2c_core)]
+fn init_i2c0_bus() -> crate::drivers::Result<&'static alloc::sync::Arc<I2c0Bus>> {
+    use crate::devices::{bus::Bus, i2c_core::block_i2c::BlockI2c};
+
+    if let Some(bus) = I2C0_BUS.get() {
+        return Ok(bus);
+    }
+
+    let block = BlockI2c::new(get_device!(i2c0)).map_err(|_| crate::error::code::EIO)?;
+    I2C0_BUS.call_once(|| alloc::sync::Arc::new(Bus::new(block)));
+    I2C0_BUS.get().ok_or(crate::error::code::EIO)
+}
+
+pub(crate) fn init_i2c_bus() {
+    #[cfg(cst9220)]
+    {
+        use crate::drivers::InitDriver;
+
+        let bus = init_i2c0_bus().expect("failed to initialize ESP32-C6 I2C0");
+        for device in crate::boards::get_bus_devices!(i2c0_bus) {
+            bus.register_device(device)
+                .expect("failed to register ESP32-C6 I2C0 device");
+        }
+
+        if let Ok(driver) =
+            bus.probe_driver(&crate::drivers::input::cst9220::Cst9220DriverModule::<
+                blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
+            >::new())
+        {
+            if let Err(error) = driver.init(bus) {
+                kearly_println!("Failed to initialize CST9220 driver: {}", error);
+                log::warn!("Failed to initialize CST9220 driver: {}", error);
+            } else {
+                kearly_println!("CST9220 touch device registered as /dev/cst9220");
+            }
+        } else {
+            kearly_println!("CST9220 device description was not found on I2C0");
+            log::warn!("CST9220 device description was not found on I2C0");
+        }
+    }
+}
 pub(crate) fn init_gpio() {}
 
 #[inline(always)]

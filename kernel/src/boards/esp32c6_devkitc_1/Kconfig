@@ -23,6 +23,16 @@ config SOC_ESP32C6
     default y
     select RISCV
     select HAS_MIE
+    select I2C_CORE
+
+config CST9220
+    bool "Enable CST9220 touch controller"
+    default n
+    select I2C_CORE
+    select USE_EMBEDDED_HAL_V1
+    help
+      Enable the CST9220 capacitive touch controller on the Waveshare
+      ESP32-C6 Touch AMOLED 2.16-inch board.
 
 config LCD
     bool "Enable LCD device"
@@ -91,6 +101,23 @@ config CO5300_SIO3_GPIO
 config CO5300_CS_GPIO
     int "CO5300 chip-select GPIO"
     default 15
+    range 0 30
+
+config CST9220_SDA_GPIO
+    int "CST9220 I2C SDA GPIO"
+    default 8
+    range 0 30
+config CST9220_SCL_GPIO
+    int "CST9220 I2C SCL GPIO"
+    default 7
+    range 0 30
+config CST9220_INT_GPIO
+    int "CST9220 interrupt GPIO"
+    default 5
+    range 0 30
+config CST9220_RST_GPIO
+    int "CST9220 reset GPIO"
+    default 11
     range 0 30
 
 config NUM_IRQS

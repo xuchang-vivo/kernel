@@ -14,3 +14,6 @@
 
 #[cfg(ft6336u)]
 pub mod ft6336u;
+
+#[cfg(cst9220)]
+pub mod cst9220;

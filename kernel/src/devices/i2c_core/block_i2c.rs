@@ -26,7 +26,7 @@ pub struct BlockI2c<T: PlatPeri> {
 impl<T: blueos_hal::i2c::I2c<I2cConfig, ()>> BlockI2c<T> {
     pub fn new(inner: &'static T) -> Result<Self, blueos_hal::err::HalError> {
         inner.configure(&I2cConfig {
-            // FT6336U supports Fast-mode; use it to keep touch polling latency low.
+            // CST9220 supports Fast-mode; use it to keep touch polling latency low.
             baudrate: DEFAULT_I2C_BAUDRATE,
         })?;
         Ok(BlockI2c { inner })
@@ -79,6 +79,22 @@ impl<T: blueos_hal::i2c::I2c<I2cConfig, ()>> BlockI2c<T> {
                 self.inner.send_byte_with_stop(*byte)?;
             } else {
                 self.inner.write_data8(*byte);
+                // `Has8bitDataReg::write_data8` predates the fallible I2C
+                // trait and cannot return its error directly.  Esp32I2c
+                // latches NACK/timeout status, so inspect it immediately;
+                // otherwise a failed byte would be silently followed by the
+                // next register transaction and reported as a misleading
+                // protocol error by the touch driver.
+                if self.inner.get_error_status() != 0 {
+                    let error = self.inner.get_error_status();
+                    self.inner.clear_error_status();
+                    abrt_ret = Err(if error & (1 << 10) != 0 {
+                        blueos_hal::err::HalError::NoAck
+                    } else {
+                        blueos_hal::err::HalError::Fail
+                    });
+                    break 'outer;
+                }
             }
         }
 
@@ -111,6 +127,19 @@ impl<T: blueos_hal::i2c::I2c<I2cConfig, ()>> BlockI2c<T> {
                 *byte = self.inner.read_byte_with_stop()?;
             } else {
                 *byte = self.inner.read_data8()?;
+                // The legacy byte-read API reports errors through the
+                // controller's latched status. Surface them before issuing
+                // the next byte so a NACK/timeout cannot be mistaken for a
+                // malformed CST9220 attribute response.
+                if self.inner.get_error_status() != 0 {
+                    let error = self.inner.get_error_status();
+                    self.inner.clear_error_status();
+                    return Err(if error & (1 << 10) != 0 {
+                        blueos_hal::err::HalError::NoAck
+                    } else {
+                        blueos_hal::err::HalError::Fail
+                    });
+                }
             }
         }
 
