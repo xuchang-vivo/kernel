@@ -23,8 +23,12 @@ MEMORY
           RTC_IRAM/RTC_DRAM 0x50000000
     */
 
-    /* Unified HP RAM: executable + readable + writable */
-    RAM : ORIGIN = 0x40800000, LENGTH = 0x6E610
+    /* Unified HP RAM: executable + readable + writable.
+     * Keep the top 64 KiB available as a separately-addressable region. */
+    RAM : ORIGIN = 0x40800000, LENGTH = 0x5E610
+
+    /* Additional 64 KiB carved out of the top of HP RAM. */
+    EXTRA_RAM : ORIGIN = ORIGIN(RAM) + LENGTH(RAM), LENGTH = 0x10000
 
     /* External flash.
 
@@ -258,6 +262,15 @@ SECTIONS
     . += 0x6000;
     __sys_stack_end = .;
   } > RWDATA
+
+  /* Keep the carved-out RAM out of the normal allocator/linker region while
+   * exporting a stable range for users that need this dedicated memory. */
+  .extra_ram (NOLOAD) : {
+    . = ALIGN(4);
+    __extra_ram_start = .;
+    . += LENGTH(EXTRA_RAM);
+    __extra_ram_end = .;
+  } > EXTRA_RAM
 }
 
 SECTIONS {
