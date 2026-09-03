@@ -70,4 +70,26 @@ impl SpiConfig {
             cs_pin: None,
         }
     }
+
+    /// Mode 0, MSB-first, 400 kHz — the SD card identification clock.
+    pub fn sd_card_init() -> Self {
+        SpiConfig {
+            baudrate: 400_000,
+            phase: SpiPhase::Phase0,
+            polarity: SpiPolarity::Low,
+            bit_order: SpiBitOrder::MsbFirst,
+            cs_pin: None,
+        }
+    }
+
+    /// Mode 0, MSB-first, 20 MHz — a conservative SD-over-SPI data clock.
+    pub fn sd_card_default() -> Self {
+        SpiConfig {
+            baudrate: 20_000_000,
+            phase: SpiPhase::Phase0,
+            polarity: SpiPolarity::Low,
+            bit_order: SpiBitOrder::MsbFirst,
+            cs_pin: None,
+        }
+    }
 }

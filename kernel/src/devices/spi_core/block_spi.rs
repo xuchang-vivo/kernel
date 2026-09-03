@@ -12,12 +12,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-use crate::sync::KernelDelay;
 use blueos_driver::spi::SpiConfig;
 use blueos_hal::PlatPeri;
-use embedded_hal::spi::Operation;
 
-use crate::devices::bus::{BusInterface, BusWrapper};
+use crate::devices::bus::BusInterface;
 
 pub struct BlockSpi<T: PlatPeri, G: blueos_hal::gpio::OutputPin> {
     inner: &'static T,
@@ -32,6 +30,17 @@ impl<T: blueos_hal::spi::Spi<SpiConfig, ()>, G: blueos_hal::gpio::OutputPin> Blo
     ) -> Result<Self, blueos_hal::err::HalError> {
         inner.configure(config)?;
         Ok(BlockSpi { inner, cs })
+    }
+
+    /// Reconfigure the shared SPI peripheral while no device transaction is
+    /// active.  SD cards require a slow identification clock before switching
+    /// to their normal data rate.
+    pub fn configure(&self, config: &SpiConfig) -> Result<(), blueos_hal::err::HalError> {
+        self.inner.configure(config)
+    }
+
+    pub fn clock_idle(&mut self, bytes: &[u8]) -> Result<(), crate::error::Error> {
+        self.inner.write(bytes).map_err(|_| crate::error::code::EIO)
     }
 
     pub fn assert_cs(&self) {
@@ -64,8 +73,10 @@ impl<T: blueos_hal::spi::Spi<SpiConfig, ()>, G: blueos_hal::gpio::OutputPin> Blo
     }
 }
 
-impl<T: blueos_hal::spi::Spi<SpiConfig, ()> + blueos_hal::spi::Qspi, G: blueos_hal::gpio::OutputPin>
-    BlockSpi<T, G>
+impl<
+        T: blueos_hal::spi::Spi<SpiConfig, ()> + blueos_hal::spi::Qspi,
+        G: blueos_hal::gpio::OutputPin,
+    > BlockSpi<T, G>
 {
     pub fn write_quad(&mut self, words: &[u8]) -> Result<(), crate::error::Error> {
         self.inner

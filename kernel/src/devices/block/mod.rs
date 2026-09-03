@@ -24,6 +24,8 @@ use embedded_io::{Error as IOError, ErrorKind};
 use crate::drivers::flash::spi_flash::FlashBlockError;
 #[cfg(enable_block)]
 use crate::drivers::flash::spi_flash_cmd::FlashError;
+#[cfg(sd_card)]
+use crate::drivers::sdcard::SdCardError;
 
 #[cfg(virtio)]
 use crate::devices::virtio::VirtioHal;
@@ -79,6 +81,15 @@ impl embedded_io::Error for BlockError<FlashBlockError> {
                     FlashError::InvalidParam(_) => ErrorKind::InvalidInput,
                 },
             },
+        }
+    }
+}
+
+#[cfg(sd_card)]
+impl embedded_io::Error for BlockError<SdCardError> {
+    fn kind(&self) -> ErrorKind {
+        match self {
+            BlockError::Driver(error) => error.kind(),
         }
     }
 }

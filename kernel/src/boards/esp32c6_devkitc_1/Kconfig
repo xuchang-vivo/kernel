@@ -25,6 +25,32 @@ config SOC_ESP32C6
     select HAS_MIE
     select I2C_CORE
 
+config SD_CARD
+    bool "Enable SD card over SPI"
+    default n
+    select ENABLE_BLOCK
+    select SPI_CORE
+    help
+      Enable the Waveshare ESP32-C6-Touch-LCD-1.54 microSD slot. The slot
+      uses SPI2 with a dedicated chip-select on GPIO6.
+
+config SD_CARD_SCLK_GPIO
+    int "SD card SPI clock GPIO"
+    default 0
+    range 0 30
+config SD_CARD_MOSI_GPIO
+    int "SD card SPI MOSI GPIO"
+    default 1
+    range 0 30
+config SD_CARD_MISO_GPIO
+    int "SD card SPI MISO GPIO"
+    default 2
+    range 0 30
+config SD_CARD_CS_GPIO
+    int "SD card chip-select GPIO"
+    default 6
+    range 0 30
+
 config CST9220
     bool "Enable CST9220 touch controller"
     default n

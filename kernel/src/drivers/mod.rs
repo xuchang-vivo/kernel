@@ -17,6 +17,8 @@
 use crate::devices::bus::{Bus, BusInterface};
 
 pub(crate) mod flash;
+#[cfg(sd_card)]
+pub(crate) mod sdcard;
 pub(crate) mod ic;
 pub(crate) mod input;
 #[cfg(lcd)]

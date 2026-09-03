@@ -808,6 +808,9 @@ crate::define_peripheral! {
     (touch_rst, blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
      blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin::new(
          blueos_kconfig::CONFIG_CST9220_RST_GPIO as u8)),
+    (sd_cs, blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
+     blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin::new(
+         blueos_kconfig::CONFIG_SD_CARD_CS_GPIO as u8)),
 }
 
 crate::define_bus! {
@@ -822,6 +825,15 @@ crate::define_bus! {
         >,
             crate::drivers::lcd::co5300::Co5300Config::new(
                 get_device!(lcd_cs),
+            )
+        ),
+        #[cfg(sd_card)]
+        (sd_card, crate::drivers::sdcard::SdCardConfig<
+            blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
+        >,
+            crate::drivers::sdcard::SdCardConfig::new(
+                BLOCK_STORAGE_DEVICE_NAME,
+                get_device!(sd_cs),
             )
         ),
     ),
@@ -839,7 +851,7 @@ crate::define_bus! {
     ),
 }
 
-#[cfg(any(co5300, cst9220))]
+#[cfg(any(co5300, cst9220, sd_card))]
 crate::define_pin_states!(
     blueos_driver::pinctrl::esp32c6_pinctrl::Esp32c6IoMuxPinctrl,
     #[cfg(co5300)]
@@ -853,6 +865,58 @@ crate::define_pin_states!(
         Some(63),
         None,
         false,
+        false
+    ),
+    #[cfg(sd_card)]
+    (
+        blueos_kconfig::CONFIG_SD_CARD_SCLK_GPIO as u8,
+        1,
+        false,
+        false,
+        false,
+        2,
+        Some(63),
+        None,
+        false,
+        false
+    ),
+    #[cfg(sd_card)]
+    (
+        blueos_kconfig::CONFIG_SD_CARD_MOSI_GPIO as u8,
+        1,
+        false,
+        false,
+        false,
+        2,
+        Some(65),
+        None,
+        false,
+        false
+    ),
+    #[cfg(sd_card)]
+    (
+        blueos_kconfig::CONFIG_SD_CARD_MISO_GPIO as u8,
+        1,
+        true,
+        true,
+        false,
+        2,
+        None,
+        Some(64),
+        false,
+        false
+    ),
+    #[cfg(sd_card)]
+    (
+        blueos_kconfig::CONFIG_SD_CARD_CS_GPIO as u8,
+        1,
+        false,
+        true,
+        false,
+        2,
+        None,
+        None,
+        true,
         false
     ),
     #[cfg(co5300)]
@@ -872,12 +936,12 @@ crate::define_pin_states!(
     (
         blueos_kconfig::CONFIG_CO5300_SIO1_GPIO as u8,
         1,
-        false,
+        true,
         false,
         false,
         2,
         Some(64),
-        None,
+        Some(64),
         false,
         false
     ),
@@ -976,8 +1040,13 @@ crate::define_pin_states!(
     ),
 );
 
-#[cfg(not(any(co5300, cst9220)))]
+#[cfg(not(any(co5300, cst9220, sd_card)))]
 crate::define_pin_states!(None);
+
+pub const BLOCK_STORAGE_DEVICE_NAME: &str = "sdcard-storage";
+pub const BLOCK_STORAGE_MOUNT_POINT: &str = "data";
+pub const BLOCK_STORAGE_POLICY: crate::boards::BlockStoragePolicy =
+    crate::boards::BlockStoragePolicy::Optional;
 
 #[cfg(spi_core)]
 type Spi2Bus = crate::devices::bus::Bus<
@@ -1030,6 +1099,21 @@ pub(crate) fn init_spi_bus() {
             log::warn!("Failed to initialize CO5300 driver: {}", error);
         } else {
             kearly_println!("CO5300 framebuffer registered");
+        }
+    }
+
+    #[cfg(sd_card)]
+    {
+        let result = bus
+            .probe_driver(&crate::drivers::sdcard::SdCardDriverModule::<
+                blueos_driver::gpio::esp32c6_gpio::Esp32c6GpioOutputPin,
+            >::new())
+            .and_then(|driver| driver.init(bus));
+        if let Err(error) = result {
+            if !BLOCK_STORAGE_POLICY.allows_missing() || error != crate::error::code::ENODEV {
+                panic!("SD card initialization failed: {}", error);
+            }
+            log::warn!("SD card not present, skipping: {}", error);
         }
     }
 }

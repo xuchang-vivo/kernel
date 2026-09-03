@@ -23,18 +23,18 @@ use core::{
 
 use blueos_driver::spi::SpiConfig;
 use display_driver::{
-    Area, ColorFormat, DisplayDriver, DisplayError, FrameControl,
     bus::{DisplayBus, ErrorType, Metadata, QspiFlashBus},
     panel::reset::LCDResetOption,
+    Area, ColorFormat, DisplayDriver, DisplayError, FrameControl,
 };
-use display_driver_co5300::{Co5300, spec::Co5300Spec};
+use display_driver_co5300::{spec::Co5300Spec, Co5300};
 
 use crate::{
     devices::{
-        DeviceData,
         bus::{Bus, BusWrapper},
         gpio::{GeneralGpio, Level},
         spi_core::block_spi::BlockSpi,
+        DeviceData,
     },
     drivers::{DriverModule, InitDriver},
     sync::KernelDelay,
@@ -65,8 +65,12 @@ where
         &mut self,
         transfer: impl FnOnce(&mut BlockSpi<T, G>) -> crate::drivers::Result<()>,
     ) -> crate::drivers::Result<()> {
+        let mut inner = self.spi.0.lock();
+        inner
+            .configure(&SpiConfig::qspi_display_default())
+            .map_err(|_| crate::error::code::EIO)?;
         self.cs.set_low().map_err(|_| crate::error::code::EIO)?;
-        let result = transfer(&mut self.spi.0.lock());
+        let result = transfer(&mut inner);
         let cs_result = self.cs.set_high().map_err(|_| crate::error::code::EIO);
         result.and(cs_result)
     }

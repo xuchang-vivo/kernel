@@ -42,6 +42,50 @@ impl<T: blueos_hal::spi::Spi<SpiConfig, ()>, G: blueos_hal::gpio::OutputPin>
     fn deassert_cs(&self) {
         self.cs.set_high().ok();
     }
+
+    /// Execute operations while keeping chip select asserted for the complete
+    /// callback.  This is needed by SD SPI data phases, where the card keeps
+    /// a read token or write-busy state across multiple transfers.
+    pub fn with_cs<R, E>(
+        &mut self,
+        f: impl FnOnce(&mut BlockSpi<T, G>) -> Result<R, E>,
+    ) -> Result<R, E> {
+        let mut inner = self.spi.0.lock();
+        self.assert_cs();
+        let result = f(&mut inner);
+        self.deassert_cs();
+        result
+    }
+
+    /// Reconfigure the bus and execute one transaction with chip select held
+    /// low.  Configuration is performed while the bus lock is held and before
+    /// chip select is asserted, so shared SPI devices cannot observe a partial
+    /// speed change.
+    pub fn with_cs_config<R, E>(
+        &mut self,
+        config: &SpiConfig,
+        f: impl FnOnce(&mut BlockSpi<T, G>) -> Result<R, E>,
+    ) -> Result<R, E>
+    where
+        E: From<crate::error::Error>,
+    {
+        let mut inner = self.spi.0.lock();
+        inner
+            .configure(config)
+            .map_err(|_| E::from(crate::error::code::EIO))?;
+        self.assert_cs();
+        let result = f(&mut inner);
+        self.deassert_cs();
+        result
+    }
+
+    /// Clock the bus with chip select deasserted. SD cards require at least
+    /// 74 idle clocks before the first command during card identification.
+    pub fn clock_idle(&mut self, bytes: &[u8]) -> Result<(), crate::error::Error> {
+        let mut inner = self.spi.0.lock();
+        self.deassert_cs();
+        inner.clock_idle(bytes)
+    }
 }
 
 #[cfg(use_embedded_hal_v1)]
