@@ -375,7 +375,11 @@ impl Timeval {
         }
         if len == core::mem::size_of::<Timeval32>() as libc::socklen_t {
             let tv_sec = i32::try_from(self.tv_sec).ok()?;
-            let tv_usec = i32::try_from(self.tv_usec).ok()?;
+            // `tv_usec` is always in `0..1_000_000` (enforced by `validated()` and the
+            // `From<Duration>` constructor), so it always fits in an `i32`; use a cast
+            // instead of `i32::try_from`, which would be a useless conversion on targets
+            // where `suseconds_t` is already `i32` (e.g. 32-bit newlib).
+            let tv_usec = self.tv_usec as i32;
             (ptr as *mut Timeval32).write(Timeval32 { tv_sec, tv_usec });
             return Some(core::mem::size_of::<Timeval32>() as libc::socklen_t);
         }
