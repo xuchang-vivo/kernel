@@ -1056,12 +1056,7 @@ impl OperationIPCReply {
 
 fn duration_to_tick(timeout: Duration) -> Tick {
     let micros = timeout.as_micros().min(u64::MAX as u128) as u64;
-    let ticks = Tick::from_micros(micros);
-    if ticks == Tick(0) {
-        Tick(1)
-    } else {
-        ticks
-    }
+    Tick::from_micros_ceil(micros)
 }
 
 fn duration_to_millis(timeout: Option<Duration>) -> usize {
