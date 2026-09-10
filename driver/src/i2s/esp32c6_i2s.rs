@@ -41,6 +41,18 @@ const PCR_BASE: usize = 0x6009_6000;
 /// XTAL frequency on ESP32-C6 (40 MHz).
 const XTAL_HZ: u32 = 40_000_000;
 
+/// Greatest common divisor (Euclidean algorithm).
+const fn gcd(a: u32, b: u32) -> u32 {
+    let mut a = a;
+    let mut b = b;
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
+}
+
 /// Polling iteration cap for DMA wait.
 const POLL_LIMIT: u32 = 10_000_000;
 
@@ -219,7 +231,7 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
     /// XTAL into MCLK: `div = XTAL / MCLK`. The I2S BCK divider then produces
     /// BCK = MCLK / (2 × half_sample_bits), where `half_sample_bits = bits ×
     /// channels / 2`.
-    fn configure_clock(&self, sample_rate: u32, bits: u8, channels: u8) -> blueos_hal::err::Result<()> {
+    fn configure_clock(&self, sample_rate: u32, bits: u8, slot_width: u8, channels: u8) -> blueos_hal::err::Result<()> {
         if sample_rate == 0 || bits == 0 || channels == 0 {
             return Err(blueos_hal::err::HalError::InvalidParam);
         }
@@ -234,14 +246,17 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
             return Err(blueos_hal::err::HalError::NotSupport);
         }
 
-        // half_sample_bits = (bits × channels) / 2. For 16-bit stereo = 16.
-        let half_sample_bits = (bits as u32 * channels as u32) / 2;
+        // half_sample_bits = (slot_width × channels) / 2. The slot width, not
+        // the data width, determines the BCK count per frame — matching the
+        // reference ESP-IDF `I2S_STD_MSB_SLOT_DEFAULT_CONFIG(32, ...)`.
+        // For 32-bit slots × stereo = 32.
+        let half_sample_bits = (slot_width as u32 * channels as u32) / 2;
         if half_sample_bits == 0 || half_sample_bits > 63 {
             return Err(blueos_hal::err::HalError::NotSupport);
         }
 
-        // BCK = sample_rate * bits * channels.
-        let bck_target = sample_rate * bits as u32 * channels as u32;
+        // BCK = sample_rate * slot_width * channels.
+        let bck_target = sample_rate * slot_width as u32 * channels as u32;
         let bck_div_num = mclk / bck_target;
         if bck_div_num == 0 || bck_div_num > 64 {
             return Err(blueos_hal::err::HalError::NotSupport);
@@ -263,23 +278,62 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
                 + PcrI2sClkmConf::I2S_MCLK_SEL.val(1),
         );
 
-        // Configure fractional clock divider for integer division.
-        // For integer MCLK division (no fractional part), the divider must
-        // be programmed with x=0, y=0, z=0, yn1=1 (register value 0x0800_0000).
-        // The hardware reset default (0x00000200, DIV_Z=512) configures an
-        // incorrect fractional divider that prevents MCLK/BCK generation.
-        self.pcr.i2s_tx_clkm_div_conf.set(0x0800_0000);
-        self.pcr.i2s_rx_clkm_div_conf.set(0x0800_0000);
+        // Configure the fractional clock divider (PCR.I2S_TX/RX_CLKM_DIV_CONF).
+        //
+        // The integer divider (I2S_CLKM_DIV_NUM) alone can only produce
+        // f_xtal / N.  For 16 kHz × 256 = 4.096 MHz with a 40 MHz XTAL the
+        // ratio is 625/64 = 9.765625, which is not an integer.  The PCR
+        // fractional divider fills in the sub-integer part so the ES8311
+        // receives an exact MCLK that matches a coeff_div[] table entry.
+        //
+        // Register layout (ESP32-C6 TRM):
+        //   Z    [0:8]   (9 bits, 0-511)
+        //   Y    [9:17]  (9 bits, 0-511)
+        //   X    [18:26] (9 bits, 0-511)
+        //   YN1  [27]    (1 bit)
+        //   [28:31] reserved
+        //
+        // Given the fractional part b/a (already reduced to lowest terms),
+        // the field values are:
+        //   b <= a/2:  Z=b, Y=a%b, X=floor(a/b)-1, YN1=0
+        //   b >  a/2:  Z=a-b, Y=a%(a-b), X=floor(a/(a-b))-1, YN1=1
+        //
+        // When the division is exact (no fractional part) the register is
+        // programmed with x=0, y=0, z=0, yn1=1 (0x0800_0000).
+        let div_conf = {
+            let remainder = XTAL_HZ % mclk;
+            if remainder == 0 {
+                0x0800_0000
+            } else {
+                let a = mclk / gcd(mclk, remainder);
+                let b = remainder / gcd(mclk, remainder);
+                let (z, y, x, yn1) = if b <= a / 2 {
+                    (b, a % b, a / b - 1, 0)
+                } else {
+                    (a - b, a % (a - b), a / (a - b) - 1, 1)
+                };
+                (z & 0x1FF) | ((y & 0x1FF) << 9) | ((x & 0x1FF) << 18) | (yn1 << 27)
+            }
+        };
+        log::info!(
+            "[I2S] MCLK div: integer={}, fractional=0x{:08x} (target {} Hz)",
+            mclk_div,
+            div_conf,
+            mclk
+        );
+        self.pcr.i2s_tx_clkm_div_conf.set(div_conf);
+        self.pcr.i2s_rx_clkm_div_conf.set(div_conf);
 
         // Program BCK divider and bit width in CONF1.
+        // BITS_MOD = data bits (16), TDM_CHAN_BITS = slot width (32, matching
+        // the reference `I2S_STD_MSB_SLOT_DEFAULT_CONFIG(32, ...)`).
         let bits_field = (bits as u32 - 1) & 0x1f;
         let hsb_field = (half_sample_bits - 1) & 0x3f;
 
         // TDM_WS_WIDTH: WS pulse width in BCK periods (half-frame for Philips).
-        // TDM_CHAN_BITS: bits per TDM channel (same as data bits for standard I2S).
         // BCK_NO_DLY: BCK not delayed in master mode (Philips standard).
         let tdm_ws_width = (half_sample_bits - 1) & 0x7f;
-        let tdm_chan_bits = (bits as u32 - 1) & 0x1f;
+        let tdm_chan_bits = (slot_width as u32 - 1) & 0x1f;
 
         // TX_CONF1: BCK_DIV_NUM | BITS_MOD | HALF_SAMPLE_BITS | MSB_SHIFT (Philips).
         self.registers.tx_conf1.write(
@@ -312,17 +366,17 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
     /// The actual TX/RX unit and FIFO reset happens in `configure()` after
     /// `tx_update()`, not here.
     fn configure_tx(&self, cfg: &I2sConfig) {
-        // Build TX_CONF value.
-        // SIG_LOOPBACK: TX and RX share the same WS and BCK (loopback mode).
+        // Build TX_CONF value — matches the reference ESP-IDF I2S std mode.
         // TX_TDM_EN: TDM mode (TRM: TDM_EN and PDM_EN cannot be both 0 or both 1).
         // TX_MONO_FST_VLD: first channel data is valid in mono mode.
         // TX_CHAN_MOD=0: two channels, both left and right active (stereo).
+        // SIG_LOOPBACK and TX_STOP_EN are NOT set — the reference example uses
+        // standard I2S mode (BCK/WS output to GPIO, no internal loopback) and
+        // does not set TX_STOP_EN (which can halt TX before data is drained).
         let mut conf = TxConf::TX_PCM_BYPASS::SET
-            + TxConf::TX_STOP_EN::SET
             + TxConf::TX_TDM_EN::SET
             + TxConf::TX_MONO_FST_VLD::SET
-            + TxConf::TX_CHAN_MOD.val(0)
-            + TxConf::SIG_LOOPBACK::SET;
+            + TxConf::TX_CHAN_MOD.val(0);
         if matches!(cfg.channel_mode, I2sChannelMode::Mono) {
             conf += TxConf::TX_MONO::SET + TxConf::TX_CHAN_EQUAL::SET;
         }
@@ -344,13 +398,13 @@ impl<const TX_CH: usize, const RX_CH: usize> Esp32c6I2s0<TX_CH, RX_CH> {
     /// The actual TX/RX unit and FIFO reset happens in `configure()` after
     /// `rx_update()`, not here.
     fn configure_rx(&self, cfg: &I2sConfig) {
-        // RX_SLAVE_MOD: RX follows TX's clocks (loopback mode) so that RX
-        // uses the BCK/WS generated by TX instead of generating its own.
         // RX_TDM_EN: TDM mode (TRM: TDM_EN and PDM_EN cannot be both 0 or both 1).
         // RX_MONO_FST_VLD: first channel data is valid in mono mode.
         // RX_STOP_MODE=2: stop when RX_START=0 or RX FIFO is full.
+        // RX_SLAVE_MOD is NOT set — it was only needed for SIG_LOOPBACK mode
+        // where RX shared TX's clocks internally. In standard I2S mode RX
+        // generates its own BCK/WS (or follows the master externally).
         let mut conf = RxConf::RX_PCM_BYPASS::SET
-            + RxConf::RX_SLAVE_MOD::SET
             + RxConf::RX_TDM_EN::SET
             + RxConf::RX_MONO_FST_VLD::SET
             + RxConf::RX_STOP_MODE.val(2);
@@ -519,7 +573,7 @@ impl<const TX_CH: usize, const RX_CH: usize> Configuration<I2sConfig>
         };
 
         // 1. Clock tree first (TRM 30.9 — clock must be configured before reset).
-        self.configure_clock(cfg.sample_rate, cfg.bits_per_sample, channels)?;
+        self.configure_clock(cfg.sample_rate, cfg.bits_per_sample, cfg.slot_width, channels)?;
 
         // 2. TX/RX data mode + channel mode (TRM 30.9 step 4).
         self.configure_tx(cfg);

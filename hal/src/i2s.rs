@@ -43,10 +43,16 @@ pub struct I2sConfig {
     /// Master-clock (MCLK) multiplier relative to the sample rate (e.g. 256, 384).
     /// `0` disables MCLK output.
     pub mclk_multiple: u32,
+    /// Slot width on the I2S bus (bits per channel slot). The data bits
+    /// (`bits_per_sample`) are left-justified within the slot. The reference
+    /// ESP-IDF example uses 32-bit slots with 16-bit data
+    /// (`I2S_STD_MSB_SLOT_DEFAULT_CONFIG(32, ...)`), which doubles BCK
+    /// compared to 16-bit slots.
+    pub slot_width: u8,
 }
 
 impl I2sConfig {
-    /// 16 kHz, 16-bit, stereo, Philips, MCLK = 256×fs.
+    /// 16 kHz, 16-bit data in 32-bit slots, stereo, Philips, MCLK = 256×fs.
     pub fn default_16k() -> Self {
         I2sConfig {
             sample_rate: 16_000,
@@ -54,10 +60,11 @@ impl I2sConfig {
             channel_mode: I2sChannelMode::Stereo,
             format: I2sFormat::Philips,
             mclk_multiple: 256,
+            slot_width: 32,
         }
     }
 
-    /// 48 kHz, 16-bit, stereo, Philips, MCLK = 256×fs.
+    /// 48 kHz, 16-bit data in 32-bit slots, stereo, Philips, MCLK = 256×fs.
     pub fn default_48k() -> Self {
         I2sConfig {
             sample_rate: 48_000,
@@ -65,6 +72,7 @@ impl I2sConfig {
             channel_mode: I2sChannelMode::Stereo,
             format: I2sFormat::Philips,
             mclk_multiple: 256,
+            slot_width: 32,
         }
     }
 }

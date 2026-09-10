@@ -1157,6 +1157,17 @@ pub(crate) fn init_i2s() {
     // Initialize the I2S0 peripheral and register /dev/i2s0.
     let i2s = get_device!(i2s0);
     i2s.enable();
+    // Configure the I2S clock tree (MCLK/BCK/WS) before initializing the
+    // ES8311 codec. The codec's internal state machine needs MCLK running
+    // to latch its register settings correctly. This matches the reference
+    // ESP-IDF example which calls i2s_channel_enable() before es8311_open().
+    use blueos_hal::Configuration;
+    if let Err(e) = i2s.configure(&blueos_hal::i2s::I2sConfig::default_16k()) {
+        kearly_println!("Failed to configure I2S0 clocks: {:?}", e);
+        log::warn!("Failed to configure I2S0 clocks: {:?}", e);
+    } else {
+        kearly_println!("I2S0 clocks configured (MCLK/BCK/WS running)");
+    }
     let device = I2sDevice::new(i2s);
     if let Err(e) = device.register("i2s0") {
         kearly_println!("Failed to register I2S0 device: {:?}", e);
@@ -1166,15 +1177,15 @@ pub(crate) fn init_i2s() {
     }
 
     // Register the I2S loopback test device as /dev/i2s_test.
-    // Uses the same Esp32c6I2s0 driver; write() triggers a simultaneous
-    // TX/RX transfer with GPIO-matrix loopback (DOUT→DIN on the same pin).
-    let i2s_test = crate::devices::i2s_test::I2sTestDevice::new(i2s);
-    if let Err(e) = i2s_test.register("i2s_test") {
-        kearly_println!("Failed to register I2S test device: {:?}", e);
-        log::warn!("Failed to register I2S test device: {:?}", e);
-    } else {
-        kearly_println!("I2S test device registered as /dev/i2s_test");
-    }
+    // Disabled: the GPIO-matrix loopback (DOUT→DIN on the same pin) is not
+    // needed for audio playback and conflicts with the codec DIN pin.
+    // let i2s_test = crate::devices::i2s_test::I2sTestDevice::new(i2s);
+    // if let Err(e) = i2s_test.register("i2s_test") {
+    //     kearly_println!("Failed to register I2S test device: {:?}", e);
+    //     log::warn!("Failed to register I2S test device: {:?}", e);
+    // } else {
+    //     kearly_println!("I2S test device registered as /dev/i2s_test");
+    // }
 
     // Register the GDMA M2M self-test device as /dev/gdma_test.
     let gdma_test = crate::devices::gdma_test::GdmaTestDevice::new();
