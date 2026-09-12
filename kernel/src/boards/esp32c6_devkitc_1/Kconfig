@@ -25,6 +25,53 @@ config SOC_ESP32C6
     select HAS_MIE
     select I2C_CORE
 
+config I2S
+    bool "Enable I2S driver"
+    default n
+    help
+      Enable the ESP32-C6 I2S0 register-level driver with GDMA support.
+      Required for audio playback/capture on boards with I2S codecs
+      (e.g. ES8311 on the Waveshare ESP32-C6 Touch AMOLED 2.16).
+
+if I2S
+config I2S_MCLK_GPIO
+    int "I2S MCLK GPIO"
+    default 19
+    range 0 30
+config I2S_BCLK_GPIO
+    int "I2S BCLK GPIO"
+    default 20
+    range 0 30
+config I2S_WS_GPIO
+    int "I2S WS (LRCK) GPIO"
+    default 22
+    range 0 30
+config I2S_DOUT_GPIO
+    int "I2S DOUT (TX data) GPIO"
+    default 23
+    range 0 30
+config I2S_DIN_GPIO
+    int "I2S DIN (RX data) GPIO"
+    default 21
+    range 0 30
+
+config ES8311_PA
+    bool "Enable ES8311 external PA control GPIO"
+    default n
+    help
+      Enable an external PA power-control GPIO for the ES8311 codec.
+      The Waveshare ESP32-C6 Touch AMOLED 2.16 board config sets
+      pa:-1 (no external PA), so this is disabled by default.
+
+config ES8311_PA_GPIO
+    int "ES8311 PA control GPIO"
+    default 26
+    range 0 30
+    depends on ES8311_PA
+    help
+      GPIO pin used to enable/disable the external PA.
+endif
+
 config CST9220
     bool "Enable CST9220 touch controller"
     default n

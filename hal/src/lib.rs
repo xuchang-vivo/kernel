@@ -24,6 +24,7 @@ pub mod clock;
 pub mod clock_control;
 pub mod gpio;
 pub mod i2c;
+pub mod i2s;
 pub mod isr;
 pub mod pinctrl;
 pub mod reset;

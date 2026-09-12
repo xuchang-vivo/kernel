@@ -25,6 +25,8 @@ pub(crate) mod msip;
 pub(crate) mod sensor;
 pub(crate) mod serial;
 pub(crate) mod timer;
+#[cfg(i2s)]
+pub(crate) mod audio;
 
 /// use c-compatible error type
 pub type Result<T> = core::result::Result<T, crate::error::Error>;
